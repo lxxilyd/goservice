@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"goservice/svc"
-	"goservice/update"
+	"github.com/lxxilyd/goservice/svc"
+	"github.com/lxxilyd/goservice/update"
 )
 
 // version is injected at build time:
