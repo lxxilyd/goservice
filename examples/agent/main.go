@@ -6,6 +6,9 @@
 //	agent status | start | stop | restart
 //	agent uninstall
 //	agent -repo owner/repo update                  self-update from GitHub
+//	agent -repo owner/repo -base-url https://git.example.com/api/v1 -token T update
+//	agent -gitlab group/app -base-url https://gitlab.example.com -token T update
+//	agent -url https://dl.example.com/app_linux_amd64 -version v1.2.3 update
 package main
 
 import (
@@ -41,6 +44,11 @@ func realMain() error {
 	name := flag.String("name", "example-agent", "service name")
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	repo := flag.String("repo", "", "owner/repo used by the update command")
+	gitlab := flag.String("gitlab", "", "GitLab project path or ID used by the update command")
+	baseURL := flag.String("base-url", "", "API root of a self-hosted git host, e.g. https://git.example.com/api/v1")
+	url := flag.String("url", "", "download one artifact directly, bypassing any release API")
+	remote := flag.String("remote-version", "", "version of -url when it cannot be read from the link")
+	token := flag.String("token", "", "token for a private repository or an authenticated download")
 	logDir := flag.String("logdir", "", "directory for stdout/stderr on init-script backends")
 
 	flag.Usage = func() {
@@ -92,7 +100,14 @@ func realMain() error {
 		return runServiceCommand(ctx, manager, command)
 
 	case "update":
-		return runUpdate(ctx, def, *repo)
+		return runUpdate(ctx, def, updateOptions{
+			repo:    *repo,
+			gitlab:  *gitlab,
+			baseURL: *baseURL,
+			url:     *url,
+			version: *remote,
+			token:   *token,
+		})
 
 	default:
 		return fmt.Errorf("unknown command %q", command)
@@ -129,17 +144,25 @@ func runServiceCommand(ctx context.Context, manager svc.Manager, command string)
 	}
 }
 
-func runUpdate(ctx context.Context, def svc.Definition, repo string) error {
-	if repo == "" {
-		return errors.New("-repo owner/repo is required for the update command")
-	}
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("-repo must look like owner/repo, got %q", repo)
+// updateOptions is what the -url / -repo / -gitlab / -base-url / -token flags
+// describe.
+type updateOptions struct {
+	repo    string
+	gitlab  string
+	baseURL string
+	url     string
+	version string
+	token   string
+}
+
+func runUpdate(ctx context.Context, def svc.Definition, opts updateOptions) error {
+	source, err := opts.source()
+	if err != nil {
+		return err
 	}
 
 	updater := &update.Updater{
-		Source:  &update.GitHubSource{Owner: parts[0], Repo: parts[1]},
+		Source:  source,
 		Version: version,
 		// Restart through the service manager so the new binary takes over.
 		Restart: func(ctx context.Context) error {
@@ -161,6 +184,31 @@ func runUpdate(ctx context.Context, def svc.Definition, repo string) error {
 	}
 	fmt.Printf("updated %s -> %s\n", result.From, result.To)
 	return nil
+}
+
+// source picks the release channel the flags describe: a single download URL,
+// a GitLab project, or a GitHub-compatible release API (GitHub itself, or a
+// self-hosted Gitea/Forgejo through BaseURL).
+func (o updateOptions) source() (update.Source, error) {
+	if o.url != "" {
+		return &update.URLSource{URL: o.url, Version: o.version, Token: o.token}, nil
+	}
+	if o.gitlab != "" {
+		return &update.GitLabSource{Project: o.gitlab, BaseURL: o.baseURL, Token: o.token}, nil
+	}
+	if o.repo == "" {
+		return nil, errors.New("the update command needs -repo, -gitlab or -url")
+	}
+	parts := strings.SplitN(o.repo, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("-repo must look like owner/repo, got %q", o.repo)
+	}
+	return &update.GitHubSource{
+		Owner:   parts[0],
+		Repo:    parts[1],
+		BaseURL: o.baseURL,
+		Token:   o.token,
+	}, nil
 }
 
 func serve(ctx context.Context, addr string) error {

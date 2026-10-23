@@ -33,11 +33,43 @@ var (
 // Release describes one published build.
 type Release struct {
 	Version string
-	URL     string
+	// URL is the artifact to download. It may point anywhere: a release asset,
+	// an object store, a signed CDN link.
+	URL string
 	// SHA256 is the hex encoded digest of the artifact. Empty disables the
 	// built-in check (use Verify for signatures instead).
 	SHA256 string
 	Notes  string
+	// Header is sent with the download request, for private repositories,
+	// signed URLs or an object store that wants an extra header. Build it with
+	// AuthHeader for the usual token cases. Entries here override
+	// Updater.Header.
+	Header http.Header
+}
+
+// AuthHeader builds a download Header carrying token. An empty name means
+// "Authorization", where a bare token (no scheme yet) is sent as
+// "Bearer <token>"; a custom name such as GitLab's "PRIVATE-TOKEN" gets the
+// value untouched. It returns nil for an empty token, which leaves the
+// download anonymous.
+//
+//	update.AuthHeader("", "glpat-...")               -> Authorization: Bearer glpat-...
+//	update.AuthHeader("PRIVATE-TOKEN", "glpat-...")  -> PRIVATE-TOKEN: glpat-...
+//	update.AuthHeader("", "token 0123abcd")          -> Authorization: token 0123abcd
+func AuthHeader(name, token string) http.Header {
+	if token == "" {
+		return nil
+	}
+	if name == "" {
+		name = "Authorization"
+	}
+	value := token
+	if name == "Authorization" && !strings.Contains(token, " ") {
+		value = "Bearer " + token
+	}
+	header := http.Header{}
+	header.Set(name, value)
+	return header
 }
 
 // Request is what a Source needs to pick the right artifact.
@@ -72,6 +104,10 @@ type Updater struct {
 	BinaryPath string
 	// Client defaults to a 10 minute timeout client.
 	Client *http.Client
+	// Header is added to every download request and is the place for a
+	// credential that is the same for every artifact. Release.Header wins on
+	// key conflicts, so a source that knows better can still override it.
+	Header http.Header
 	// Verify, when set, runs on the downloaded bytes before they are installed.
 	// Use it for a signature check; SHA-256 is already handled via Release.
 	Verify func(rel Release, data []byte) error
@@ -128,7 +164,7 @@ func (u *Updater) Apply(ctx context.Context, rel Release) (Result, error) {
 		return Result{}, err
 	}
 
-	data, err := u.download(ctx, rel.URL)
+	data, err := u.download(ctx, rel)
 	if err != nil {
 		return Result{}, err
 	}
@@ -183,24 +219,36 @@ func (u *Updater) binaryPath() (string, error) {
 	return exe, nil
 }
 
-func (u *Updater) download(ctx context.Context, url string) ([]byte, error) {
+func (u *Updater) download(ctx context.Context, rel Release) ([]byte, error) {
 	client := u.Client
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rel.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("update: building request: %w", err)
 	}
+	for name, values := range u.Header {
+		for _, value := range values {
+			req.Header.Set(name, value)
+		}
+	}
+	for name, values := range rel.Header {
+		req.Header.Del(name)
+		for _, value := range values {
+			req.Header.Set(name, value)
+		}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("update: downloading %s: %w", url, err)
+		return nil, fmt.Errorf("update: downloading %s: %w", rel.URL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("update: downloading %s: unexpected status %s", url, resp.Status)
+		return nil, fmt.Errorf("update: downloading %s: unexpected status %s", rel.URL, resp.Status)
 	}
 	return io.ReadAll(resp.Body)
 }

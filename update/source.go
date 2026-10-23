@@ -11,10 +11,16 @@ import (
 	"time"
 )
 
+// listPageSize is how many releases the list mode inspects before giving up,
+// so one release without an asset for this platform does not fail the update.
+const listPageSize = 20
+
 type ghAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
-	Digest             string `json:"digest"`
+	// URL is the asset API endpoint. GitHub only; Gitea/Forgejo omit it.
+	URL    string `json:"url"`
+	Digest string `json:"digest"`
 }
 
 type ghRelease struct {
@@ -33,8 +39,10 @@ type GitHubSource struct {
 	Repo  string
 	// AssetPattern renders the expected asset name for a request.
 	AssetPattern func(Request) string
-	// Token is an optional GitHub token, needed for private repositories and
-	// useful against the anonymous rate limit.
+	// Token is an optional token, needed for private repositories and useful
+	// against the anonymous rate limit. It is used both to query the release
+	// API and to download the asset, so a private repository updates without
+	// any further wiring.
 	Token string
 	// IncludePrerelease switches from /releases/latest to the newest /releases.
 	IncludePrerelease bool
@@ -71,7 +79,7 @@ func (g *GitHubSource) Latest(ctx context.Context, req Request) (Release, error)
 	url := fmt.Sprintf("%s/repos/%s/%s/releases/latest", base, g.Owner, g.Repo)
 	listMode := g.IncludePrerelease || req.Channel == "beta"
 	if listMode {
-		url = fmt.Sprintf("%s/repos/%s/%s/releases?%s=1", base, g.Owner, g.Repo, pageParam)
+		url = fmt.Sprintf("%s/repos/%s/%s/releases?%s=%d", base, g.Owner, g.Repo, pageParam, listPageSize)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -93,34 +101,56 @@ func (g *GitHubSource) Latest(ctx context.Context, req Request) (Release, error)
 		return Release{}, fmt.Errorf("update: GitHub returned %s for %s", resp.Status, url)
 	}
 
-	var latest ghRelease
+	var releases []ghRelease
 	if listMode {
-		var releases []ghRelease
 		if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
 			return Release{}, fmt.Errorf("update: decoding GitHub releases: %w", err)
 		}
-		if len(releases) == 0 {
-			return Release{}, fmt.Errorf("update: no releases found for %s/%s", g.Owner, g.Repo)
-		}
-		latest = releases[0]
 	} else {
+		var latest ghRelease
 		if err := json.NewDecoder(resp.Body).Decode(&latest); err != nil {
 			return Release{}, fmt.Errorf("update: decoding GitHub release: %w", err)
 		}
+		releases = []ghRelease{latest}
+	}
+	if len(releases) == 0 {
+		return Release{}, fmt.Errorf("update: no releases found for %s/%s", g.Owner, g.Repo)
 	}
 
+	// Releases come newest first and the newest one does not always carry a
+	// build for every platform (a docs-only release, an arm64-only hotfix), so
+	// walk down until one has an asset for this request instead of failing on
+	// the first entry.
 	expected := g.assetName(req)
-	chosen := pickAsset(latest.Assets, expected)
-	if chosen == nil {
-		return Release{}, fmt.Errorf("update: release %s has no asset matching %q", latest.TagName, expected)
+	for _, release := range releases {
+		if chosen := pickAsset(release.Assets, expected); chosen != nil {
+			return g.release(release, chosen), nil
+		}
 	}
+	return Release{}, fmt.Errorf("update: no release of %s/%s has an asset matching %q", g.Owner, g.Repo, expected)
+}
 
+// release turns a chosen asset into a downloadable Release and carries the
+// token through to the download, which is what makes a private repository work.
+func (g *GitHubSource) release(rel ghRelease, asset *ghAsset) Release {
+	url := asset.BrowserDownloadURL
+	header := AuthHeader("", g.Token)
+	// A private GitHub asset is only reachable through the asset API:
+	// browser_download_url redirects to a signed object URL on another host and
+	// Go drops the Authorization header on a cross-host redirect, so the
+	// download would come back 404. Ask the API for the bytes instead.
+	// Gitea/Forgejo serve the file path itself, so the plain URL is right there.
+	if g.Token != "" && g.BaseURL == "" && asset.URL != "" {
+		url = asset.URL
+		header.Set("Accept", "application/octet-stream")
+	}
 	return Release{
-		Version: latest.TagName,
-		URL:     chosen.BrowserDownloadURL,
-		SHA256:  strings.TrimPrefix(chosen.Digest, "sha256:"),
-		Notes:   latest.Body,
-	}, nil
+		Version: rel.TagName,
+		URL:     url,
+		SHA256:  strings.TrimPrefix(asset.Digest, "sha256:"),
+		Notes:   rel.Body,
+		Header:  header,
+	}
 }
 
 func (g *GitHubSource) assetName(req Request) string {
@@ -144,25 +174,28 @@ func pickAsset(assets []ghAsset, expected string) *ghAsset {
 	return nil
 }
 
-// URLSource points at one release artifact directly, which is the shortest
-// path when the releases live on a self-hosted Gitea/Forgejo (or any static
-// file server) and you do not want to depend on a release API:
+// URLSource points at one release artifact directly — any URL that serves the
+// binary, not only a git host: a self-hosted Gitea/Forgejo download path, an
+// object store, a CDN, an internal file server.
 //
 //	URL: https://git.example.com/lxxilyd/gottyd/releases/download/v2026.10.23/gottyd_linux_amd64
 //
 // The version is taken from Version when set, otherwise from the version-like
 // segment of the URL (the release tag). SHA256 is optional: leave it empty to
 // skip the built-in digest check, or point it at a published checksum.
+//
+// Token and Header are handed to the download request, so a URL behind an
+// authenticated endpoint works without replacing the Updater's client.
 type URLSource struct {
 	URL     string
 	Version string
 	SHA256  string
 	Notes   string
-	// Token is sent as a bearer token, for private repositories.
+	// Token authenticates the download; see AuthHeader for the scheme rules.
 	Token string
-	// Header overrides the Authorization header name (default "Authorization").
+	// Header overrides the Authorization header name (default "Authorization"),
+	// e.g. "PRIVATE-TOKEN" for GitLab or "X-Auth-Token" for an internal service.
 	Header string
-	Client *http.Client
 }
 
 // versionFromURL returns the version-like token in a URL, for example
@@ -232,6 +265,7 @@ func (s *URLSource) Latest(ctx context.Context, req Request) (Release, error) {
 		URL:     s.URL,
 		SHA256:  strings.TrimPrefix(s.SHA256, "sha256:"),
 		Notes:   s.Notes,
+		Header:  AuthHeader(s.Header, s.Token),
 	}, nil
 }
 

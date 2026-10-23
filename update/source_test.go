@@ -71,8 +71,72 @@ func TestGitHubSourceGitea(t *testing.T) {
 	if rel.Version != "v1.3.0" {
 		t.Fatalf("list release = %+v", rel)
 	}
-	if want := "/api/v1/repos/lxxilyd/gottyd/releases?limit=1"; seen[1] != want {
+	if want := "/api/v1/repos/lxxilyd/gottyd/releases?limit=20"; seen[1] != want {
 		t.Fatalf("list request = %q, want %q", seen[1], want)
+	}
+}
+
+// TestGitHubSourceListFallsBack checks that a newest release without a build
+// for this platform does not fail the update; the next one down is used.
+func TestGitHubSourceListFallsBack(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `[
+			{"tag_name":"v2.0.0","assets":[
+				{"name":"gottyd_darwin_arm64","browser_download_url":"https://dl.example.com/v2.0.0"}]},
+			{"tag_name":"v1.9.0","assets":[
+				{"name":"gottyd_linux_mipsle","browser_download_url":"https://dl.example.com/v1.9.0"}]}]`)
+	}))
+	defer srv.Close()
+
+	src := &GitHubSource{Owner: "lxxilyd", Repo: "gottyd", BaseURL: srv.URL + "/api/v1", Client: srv.Client()}
+	rel, err := src.Latest(context.Background(), Request{OS: "linux", Arch: "mipsle", Channel: "beta"})
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if rel.Version != "v1.9.0" || rel.URL != "https://dl.example.com/v1.9.0" {
+		t.Fatalf("release = %+v, want the v1.9.0 fallback", rel)
+	}
+
+	if _, err := src.Latest(context.Background(), Request{OS: "plan9", Arch: "386", Channel: "beta"}); err == nil {
+		t.Fatal("a request no release can satisfy was accepted")
+	}
+}
+
+// TestGitHubSourcePrivateRelease covers the token plumbing: on GitHub a private
+// asset is downloaded through the asset API, because the browser URL redirects
+// to another host and loses the Authorization header on the way.
+func TestGitHubSourcePrivateRelease(t *testing.T) {
+	src := &GitHubSource{Owner: "lxxilyd", Repo: "gottyd", Token: "s3cret"}
+
+	rel := src.release(ghRelease{TagName: "v1.2.3"}, &ghAsset{
+		Name:               "gottyd_linux_amd64",
+		BrowserDownloadURL: "https://github.com/lxxilyd/gottyd/releases/download/v1.2.3/gottyd_linux_amd64",
+		URL:                "https://api.github.com/repos/lxxilyd/gottyd/releases/assets/42",
+	})
+	if rel.URL != "https://api.github.com/repos/lxxilyd/gottyd/releases/assets/42" {
+		t.Fatalf("URL = %q, want the asset API", rel.URL)
+	}
+	if got := rel.Header.Get("Authorization"); got != "Bearer s3cret" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := rel.Header.Get("Accept"); got != "application/octet-stream" {
+		t.Fatalf("Accept = %q", got)
+	}
+
+	// Gitea serves the file path itself, so the plain URL is kept there.
+	src.BaseURL = "https://git.example.com/api/v1"
+	rel = src.release(ghRelease{TagName: "v1.2.3"}, &ghAsset{
+		BrowserDownloadURL: "https://git.example.com/lxxilyd/gottyd/releases/download/v1.2.3/gottyd_linux_amd64",
+	})
+	if !strings.HasPrefix(rel.URL, "https://git.example.com/lxxilyd/gottyd/releases/download/") {
+		t.Fatalf("URL = %q, want the browser download URL", rel.URL)
+	}
+	if got := rel.Header.Get("Authorization"); got != "Bearer s3cret" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := rel.Header.Get("Accept"); got != "" {
+		t.Fatalf("Accept = %q, want empty", got)
 	}
 }
 
