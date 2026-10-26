@@ -63,7 +63,7 @@ func main() {
 
 | 源 | 用在什么场景 |
 | --- | --- |
-| `GitHubSource` | GitHub，或自建 Gitea/Forgejo（填 `BaseURL: ".../api/v1"`） |
+| `GitHubSource` | GitHub，或自建 Gitea/Forgejo（`BaseURL` 填站点根或 `.../api/v1` 都行，会自动补 `/api/v1`） |
 | `GitLabSource` | gitlab.com 或自建 GitLab（`Project: "group/app"`，默认 `PRIVATE-TOKEN`） |
 | `URLSource` | 任意下载地址；**链接必须指向最新**，带版本号的只能用 `Apply` 覆盖安装 |
 | `StaticSource` | 服务端出一份 `{"version","url","sha256"}` JSON，由它决定版本 |

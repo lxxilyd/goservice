@@ -9,14 +9,29 @@ import (
 	"testing"
 )
 
+// TestGitHubSourceEndpoint covers the URL each flavour of BaseURL resolves to.
+// A bare site root is the common self-hosted mistake (it 404s against
+// /repos/...), so it is given the Gitea API prefix automatically, exactly like
+// GitLabSource does with /api/v4.
 func TestGitHubSourceEndpoint(t *testing.T) {
-	base, param := (&GitHubSource{}).endpoint()
-	if base != "https://api.github.com" || param != "per_page" {
-		t.Fatalf("default endpoint = %q/%q", base, param)
+	cases := []struct {
+		base     string
+		wantBase string
+		wantPage string
+	}{
+		{"", "https://api.github.com", "per_page"},
+		{"https://git.example.com/api/v1/", "https://git.example.com/api/v1", "limit"},
+		{"https://git.example.com", "https://git.example.com/api/v1", "limit"},
+		{"https://git.example.com/", "https://git.example.com/api/v1", "limit"},
+		{"https://github.example.com/api/v3", "https://github.example.com/api/v3", "per_page"},
+		{"https://example.com/git", "https://example.com/git/api/v1", "limit"},
 	}
-	base, param = (&GitHubSource{BaseURL: "https://git.example.com/api/v1/"}).endpoint()
-	if base != "https://git.example.com/api/v1" || param != "limit" {
-		t.Fatalf("custom endpoint = %q/%q", base, param)
+
+	for _, tc := range cases {
+		gotBase, gotPage := (&GitHubSource{BaseURL: tc.base}).endpoint()
+		if gotBase != tc.wantBase || gotPage != tc.wantPage {
+			t.Errorf("endpoint(%q) = (%q, %q), want (%q, %q)", tc.base, gotBase, gotPage, tc.wantBase, tc.wantPage)
+		}
 	}
 }
 
@@ -169,5 +184,32 @@ func TestURLSourceVersionFromURL(t *testing.T) {
 	}
 	if rel.Version != "v9.9.9" || rel.SHA256 != "AB12" {
 		t.Fatalf("explicit version release = %+v", rel)
+	}
+}
+
+// TestGitHubSourceBareBaseURL is the regression test for a 404 that a
+// self-hosted Gitea hit: BaseURL set to the site root ("https://git.example.com")
+// produced ".../repos/..." instead of ".../api/v1/repos/...". Both forms now
+// resolve to the same API root.
+func TestGitHubSourceBareBaseURL(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"tag_name":"v1.2.3","assets":[
+			{"name":"gottyd_linux_amd64","browser_download_url":"https://dl.example.com/v1.2.3"}]}`)
+	}))
+	defer srv.Close()
+
+	src := &GitHubSource{Owner: "lxxilyd", Repo: "gottyd", BaseURL: srv.URL, Client: srv.Client()}
+	rel, err := src.Latest(context.Background(), Request{OS: "linux", Arch: "amd64"})
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if rel.Version != "v1.2.3" {
+		t.Fatalf("release = %+v", rel)
+	}
+	if want := "/api/v1/repos/lxxilyd/gottyd/releases/latest"; path != want {
+		t.Fatalf("request path = %q, want %q", path, want)
 	}
 }

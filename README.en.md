@@ -72,7 +72,7 @@ verified.
 
 | Source | Use it when |
 | --- | --- |
-| `GitHubSource` | GitHub, or self-hosted Gitea/Forgejo (`BaseURL: ".../api/v1"`) |
+| `GitHubSource` | GitHub, or self-hosted Gitea/Forgejo (`BaseURL` accepts the site root or `.../api/v1`; `/api/v1` is appended when missing) |
 | `GitLabSource` | gitlab.com or self-hosted GitLab (`Project: "group/app"`, `PRIVATE-TOKEN` by default) |
 | `URLSource` | any download URL; it must point at the **latest** build — a versioned link only works with `Apply` |
 | `StaticSource` | the server publishes `{"version","url","sha256"}` and owns the version |

@@ -44,19 +44,32 @@ type GitHubSource struct {
 	Auth Auth
 	// IncludePrerelease switches from /releases/latest to the newest /releases.
 	IncludePrerelease bool
-	// BaseURL is the API root of the host. Empty means https://api.github.com;
-	// a Gitea or Forgejo instance uses https://git.example.com/api/v1, which
-	// exposes the same /repos/{owner}/{repo}/releases layout.
+	// BaseURL is the API root of the host. Empty means https://api.github.com.
+	// Gitea and Forgejo expose the same /repos/{owner}/{repo}/releases layout,
+	// and both the site root (https://git.example.com) and the API root
+	// (https://git.example.com/api/v1) are accepted — a bare root gets /api/v1
+	// appended. GitHub Enterprise goes as https://github.example.com/api/v3.
 	BaseURL string
 	Client  *http.Client
 }
 
 // endpoint returns the API root and the page-size parameter it understands:
 // GitHub calls it per_page, Gitea and Forgejo call it limit.
+// endpoint resolves the API root. A bare site root means a self-hosted
+// Gitea/Forgejo, whose API lives at <site>/api/v1 — the same forgiveness
+// GitLabSource applies to /api/v4. An explicit API root (GitHub Enterprise's
+// /api/v3, Gitea under a subpath) is used as given. The page parameter also
+// differs: GitHub wants per_page, Gitea/Forgejo want limit.
 func (g *GitHubSource) endpoint() (base, pageParam string) {
 	base = strings.TrimRight(g.BaseURL, "/")
 	if base == "" {
 		return "https://api.github.com", "per_page"
+	}
+	if !strings.Contains(base, "/api/") {
+		base += "/api/v1"
+	}
+	if strings.Contains(base, "api.github.com") || strings.HasSuffix(base, "/api/v3") {
+		return base, "per_page"
 	}
 	return base, "limit"
 }
@@ -132,12 +145,14 @@ func (g *GitHubSource) Latest(ctx context.Context, req Request) (Release, error)
 func (g *GitHubSource) release(rel ghRelease, asset *ghAsset) Release {
 	downloadURL := asset.BrowserDownloadURL
 	header := g.Auth.HTTPHeader()
-	// A private GitHub asset is only reachable through the asset API:
-	// browser_download_url redirects to a signed object URL on another host and
-	// Go drops the Authorization header on a cross-host redirect, so the
-	// download would come back 404. Ask the API for the bytes instead.
-	// Gitea/Forgejo serve the file path itself, so the plain URL is right there.
-	if g.Auth.Token != "" && g.BaseURL == "" && asset.URL != "" {
+	_, pageParam := g.endpoint()
+	// On GitHub and GitHub Enterprise a private asset is only reachable through
+	// the asset API: browser_download_url redirects to a signed object URL on
+	// another host and Go drops the Authorization header on a cross-host
+	// redirect, so the download would come back 404. Ask the API for the bytes
+	// instead. Gitea/Forgejo serve the file path itself, so the plain URL is
+	// right there — pageParam is "per_page" exactly on the GitHub family.
+	if g.Auth.Token != "" && pageParam == "per_page" && asset.URL != "" {
 		downloadURL = asset.URL
 		header.Set("Accept", "application/octet-stream")
 	}
