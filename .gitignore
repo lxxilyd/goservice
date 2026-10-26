@@ -1,0 +1,27 @@
+# WorkBuddy workspace data (local notes, not part of the module)
+.workbuddy/
+
+# Binaries built from the packages and the example
+/examples/agent/agent
+/examples/agent/agent.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage output
+*.test
+*.out
+*.cover
+coverage.html
+
+# Files the self-update leaves next to the binary
+*.new
+*.part
+*.old
+
+# Editors and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
