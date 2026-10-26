@@ -1,0 +1,12 @@
+# Normalise line endings to LF in the repository and in the working tree: the
+# golden files are compared byte for byte, so a CRLF checkout would fail the
+# svc renderer tests on Windows.
+* text=auto eol=lf
+
+# These are compared verbatim by tests or executed by a shell.
+*.golden text eol=lf
+*.sh text eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
