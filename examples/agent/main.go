@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lxxilyd/goservice/daemon"
+	"github.com/lxxilyd/goservice"
 	"github.com/lxxilyd/goservice/svc"
 	"github.com/lxxilyd/goservice/update"
 )
@@ -123,7 +123,7 @@ func realMain() error {
 	// The whole service surface in one call: "service install", "service
 	// status", "service update" and the rest. Anything that is not a service
 	// command falls through, and the daemon handles its own arguments below.
-	handled, err := daemon.Handle(ctx, flag.Args(), daemon.Config{
+	handled, err := goservice.Handle(ctx, flag.Args(), goservice.Config{
 		Backend: *backend,
 		Service: def,
 		Source:  source,

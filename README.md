@@ -5,9 +5,9 @@
 **语言：[中文](README.md) · [English](README.en.md)**
 
 ```
-svc/      服务：安装 / 卸载 / 启动 / 停止 / 重启 / 状态
-update/   自更新：版本检查、流式下载、校验、解包、原子替换
-daemon/   两者的组合：main 里一次调用，命令行是 `service <verb>`
+goservice.Handle(...)   模块根包：main 里一次调用，命令行是 `service <verb>`
+svc/                    服务：安装 / 卸载 / 启动 / 停止 / 重启 / 状态
+update/                 自更新：版本检查、流式下载、校验、解包、原子替换
 ```
 
 ## 快速开始
@@ -16,7 +16,7 @@ daemon/   两者的组合：main 里一次调用，命令行是 `service <verb>`
 func main() {
 	_ = update.CleanupOldBinary("") // Windows 清理上次更新留下的 .old
 
-	handled, err := daemon.Handle(context.Background(), flag.Args(), daemon.Config{
+	handled, err := goservice.Handle(context.Background(), flag.Args(), goservice.Config{
 		Service: svc.Definition{
 			Name:      "mydaemon",
 			ExecPath:  "/usr/local/bin/mydaemon", // 显式写，别用默认值
@@ -38,9 +38,9 @@ func main() {
 }
 ```
 
-命令行：`mydaemon service install|uninstall|start|stop|restart|status|update`。
+导入 `github.com/lxxilyd/goservice`，包名也是 `goservice`。命令行：`mydaemon service install|uninstall|start|stop|restart|status|update`。
 
-只想用一半就别引 `daemon`：只要服务管理用 `svc.New` + `svc.Do`，只要自更新用 `update.Updater`（`daemon` 会同时链接两者，包含 `net/http`）。
+只想用一半就别引根包：只要服务管理用 `svc.New` + `svc.Do`，只要自更新用 `update.Updater`（根包会同时链接两者，包含 `net/http`）。
 
 ## 平台支持
 

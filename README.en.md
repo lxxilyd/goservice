@@ -6,9 +6,9 @@ CLI framework, logging library or application dependency.
 **Language: [中文](README.md) · [English](README.en.md)**
 
 ```
-svc/      service: install / uninstall / start / stop / restart / status
-update/   self-update: version check, streamed download, verify, unpack, replace
-daemon/   both of the above as one call in main: `service <verb>`
+goservice.Handle(...)   root package: one call in main, `service <verb>` on the CLI
+svc/                    service: install / uninstall / start / stop / restart / status
+update/                 self-update: version check, streamed download, verify, unpack, replace
 ```
 
 ## Quick start
@@ -17,7 +17,7 @@ daemon/   both of the above as one call in main: `service <verb>`
 func main() {
 	_ = update.CleanupOldBinary("") // Windows: drop the .old from the last update
 
-	handled, err := daemon.Handle(context.Background(), flag.Args(), daemon.Config{
+	handled, err := goservice.Handle(context.Background(), flag.Args(), goservice.Config{
 		Service: svc.Definition{
 			Name:      "mydaemon",
 			ExecPath:  "/usr/local/bin/mydaemon", // set it, do not rely on the default
@@ -39,10 +39,11 @@ func main() {
 }
 ```
 
-CLI: `mydaemon service install|uninstall|start|stop|restart|status|update`.
+Import `github.com/lxxilyd/goservice`; the package is also called `goservice`. CLI: `mydaemon service install|uninstall|start|stop|restart|status|update`.
 
-Need only half of it? Skip `daemon`: `svc.New` + `svc.Do` for service management,
-`update.Updater` for self-update. `daemon` links both, `net/http` included.
+Need only half of it? Skip the root package: `svc.New` + `svc.Do` for service
+management, `update.Updater` for self-update. The root package links both,
+`net/http` included.
 
 ## Platforms
 

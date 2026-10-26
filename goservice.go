@@ -1,4 +1,4 @@
-// Package daemon is the one call an application's main needs: it recognises
+// Package goservice is the one call an application's main needs: it recognises
 // "service <verb>" on the command line and does the right thing (install,
 // uninstall, start, stop, restart, status or self-update), or reports that the
 // arguments are not a service command so the application carries on.
@@ -9,7 +9,7 @@
 // should use that package directly, since importing this one pulls both.
 //
 //	func main() {
-//		handled, err := daemon.Handle(ctx, flag.Args(), daemon.Config{
+//		handled, err := goservice.Handle(ctx, flag.Args(), goservice.Config{
 //			Service: svc.Definition{Name: "gottyd", ExecPath: "/usr/local/bin/gottyd", Restart: true, AutoStart: true},
 //			Source:  &update.GitHubSource{Owner: "lxxilyd", Repo: "gottyd"},
 //			Version: Version,
@@ -19,7 +19,7 @@
 //		}
 //		// ... the daemon's own work
 //	}
-package daemon
+package goservice
 
 import (
 	"context"
@@ -86,9 +86,9 @@ func Handle(ctx context.Context, args []string, cfg Config) (handled bool, err e
 	case verb == "":
 		return true, errors.New(cfg.usage())
 	case !knownVerb(verb):
-		return true, fmt.Errorf("daemon: unknown service command %q, want one of: %s", verb, joinVerbs())
+		return true, fmt.Errorf("goservice: unknown service command %q, want one of: %s", verb, joinVerbs())
 	case verb == "update" && cfg.Source == nil:
-		return true, errors.New(`daemon: "service update" needs Config.Source`)
+		return true, errors.New(`goservice: "service update" needs Config.Source`)
 	}
 
 	def := cfg.Service
