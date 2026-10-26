@@ -2,9 +2,26 @@
 // download, checksum/signature verification and an atomic replacement that
 // survives the process still running.
 //
-// The package knows nothing about where releases come from (Source) or how the
-// process is supervised (Restart hook), so it can be reused by any daemon that
-// is installed through the sibling svc package.
+// An update has three phases, and the Updater fields follow them:
+//
+//	discovery  Source, Version, Channel   where the newest release comes from
+//	install    Auth, Target               the credential, the destination, and
+//	                                     how the artifact is verified/unpacked
+//	lifecycle  Restart, Managed          what happens after the replace
+//
+// Typical wiring, with the source chosen once by the integrator:
+//
+//	up := &update.Updater{
+//		Source:  &update.GitHubSource{Owner: "you", Repo: "mydaemon", Auth: update.Auth{Token: cfg.Token}},
+//		Version: version,
+//		Target:  update.Target{Path: "/usr/local/bin/mydaemon", Unpack: update.TarGz("mydaemon")},
+//		Restart: manager.Restart,
+//	}
+//	result, err := up.Update(ctx)   // update.ErrUpToDate when nothing to do
+//
+// The package knows nothing about how the process is supervised beyond the
+// Restart hook, so it can be reused by any daemon installed through the sibling
+// svc package.
 package update
 
 import (
@@ -42,21 +59,59 @@ type Release struct {
 	// an object store, a signed CDN link.
 	URL string
 	// SHA256 is the hex encoded digest of the artifact. Empty disables the
-	// built-in check (use Verify for signatures instead).
+	// built-in check (use Target.Verify for signatures instead).
 	SHA256 string
 	Notes  string
-	// Header is sent with the download request, for private repositories,
-	// signed URLs or an object store that wants an extra header. Build it with
-	// AuthHeader for the usual token cases. Entries here override
-	// Updater.Header.
+	// Header is the transport for the credential a Source resolved: a source
+	// returns it, Updater sends it. Sources fill it from their Auth; there is
+	// no reason to set it by hand unless you are writing a Source.
 	Header http.Header
 }
 
-// AuthHeader builds a download Header carrying token. An empty name means
+// Auth is one credential, used for both hops of an update: the release lookup
+// and the artifact download. That is the whole point of the type — a token
+// configured once works everywhere instead of having to be repeated on the
+// source and on the downloader.
+//
+//	Auth{Token: "glpat-x"}                          -> Authorization: Bearer glpat-x
+//	Auth{Token: "glpat-x", Header: "PRIVATE-TOKEN"} -> PRIVATE-TOKEN: glpat-x
+//
+// Header names the header the token goes in; empty means "Authorization", and
+// the scheme rules of AuthHeader apply (a bare token gets "Bearer ").
+type Auth struct {
+	Token  string
+	Header string
+}
+
+// HeaderFor builds the header for this credential, preferring Header and
+// falling back to defaultName when it is empty. Sources use it to keep their
+// own convention, e.g. GitLab's "PRIVATE-TOKEN".
+func (a Auth) HeaderFor(defaultName string) http.Header {
+	name := a.Header
+	if name == "" {
+		name = defaultName
+	}
+	return AuthHeader(name, a.Token)
+}
+
+// HTTPHeader builds the credential header with the generic default name.
+func (a Auth) HTTPHeader() http.Header { return a.HeaderFor("Authorization") }
+
+// applyHeader copies src into dst, replacing any value already there.
+func applyHeader(dst, src http.Header) {
+	for name, values := range src {
+		dst.Del(name)
+		for _, value := range values {
+			dst.Set(name, value)
+		}
+	}
+}
+
+// AuthHeader builds a Header carrying token. An empty name means
 // "Authorization", where a bare token (no scheme yet) is sent as
 // "Bearer <token>"; a custom name such as GitLab's "PRIVATE-TOKEN" gets the
-// value untouched. It returns nil for an empty token, which leaves the
-// download anonymous.
+// value untouched. It returns nil for an empty token, which leaves the request
+// anonymous.
 //
 //	update.AuthHeader("", "glpat-...")               -> Authorization: Bearer glpat-...
 //	update.AuthHeader("PRIVATE-TOKEN", "glpat-...")  -> PRIVATE-TOKEN: glpat-...
@@ -97,22 +152,16 @@ type Result struct {
 	To      string
 }
 
-// Updater ties a Source to a binary on disk.
-type Updater struct {
-	// Source is where new versions are discovered.
-	Source Source
-	// Version is the version currently running, used for the comparison.
-	Version string
-	// Channel is passed through to the Source ("stable", "beta", ...).
-	Channel string
-	// BinaryPath defaults to the running executable, symlinks resolved.
-	BinaryPath string
+// Target is where and how the new binary is installed: the policy half of an
+// update, kept apart from discovery (Source, Version, Channel) and lifecycle
+// (Restart, Managed) so it is obvious which knob affects which step.
+type Target struct {
+	// Path defaults to the running executable, symlinks resolved. Point it at
+	// the installed copy, not at wherever this process happens to have been
+	// started from.
+	Path string
 	// Client defaults to a 10 minute timeout client.
 	Client *http.Client
-	// Header is added to every download request and is the place for a
-	// credential that is the same for every artifact. Release.Header wins on
-	// key conflicts, so a source that knows better can still override it.
-	Header http.Header
 	// MaxBytes caps the artifact size, which is the difference between a
 	// failed update and an OOM on a router with 64 MB of RAM. Zero means the
 	// 512 MiB default; a negative value disables the limit.
@@ -126,6 +175,22 @@ type Updater struct {
 	// update.TarGz or update.Zip, or write your own to handle any archive or an
 	// install bundle.
 	Unpack UnpackFunc
+}
+
+// Updater ties a Source to a binary on disk.
+type Updater struct {
+	// Source is where new versions are discovered.
+	Source Source
+	// Version is the version currently running, used for the comparison.
+	Version string
+	// Channel is passed through to the Source ("stable", "beta", ...).
+	Channel string
+	// Auth authenticates both the release lookup and the artifact download. A
+	// Source that can use it fills Release.Header from it; when it does not,
+	// Updater applies it to the download itself.
+	Auth Auth
+	// Target says where the binary goes and how it is verified and unpacked.
+	Target Target
 	// Restart, when set, is called after a successful replacement. Wire it to
 	// svc.Manager.Restart so the new binary actually takes over.
 	Restart func(ctx context.Context) error
@@ -194,14 +259,14 @@ func (u *Updater) Apply(ctx context.Context, rel Release) (Result, error) {
 	if rel.SHA256 != "" && !strings.EqualFold(sum, strings.TrimPrefix(rel.SHA256, "sha256:")) {
 		return Result{}, fmt.Errorf("%w: %s", ErrChecksumMismatch, rel.URL)
 	}
-	if u.Verify != nil {
-		if err := u.Verify(rel, artifactPath); err != nil {
+	if u.Target.Verify != nil {
+		if err := u.Target.Verify(rel, artifactPath); err != nil {
 			return Result{}, fmt.Errorf("update: verification failed: %w", err)
 		}
 	}
 
 	switch {
-	case u.Unpack == nil:
+	case u.Target.Unpack == nil:
 		// The artifact is the binary: chmod then rename, which is atomic within
 		// the directory.
 		if err := os.Chmod(artifactPath, 0o755); err != nil {
@@ -244,7 +309,7 @@ func (u *Updater) unpack(rel Release, artifactPath, staged string) error {
 		return fmt.Errorf("update: staging %s: %w", staged, err)
 	}
 
-	if err := u.Unpack(rel, artifact, out); err != nil {
+	if err := u.Target.Unpack(rel, artifact, out); err != nil {
 		out.Close()
 		_ = os.Remove(staged)
 		return fmt.Errorf("update: unpacking %s: %w", rel.URL, err)
@@ -268,8 +333,8 @@ func (u *Updater) unpack(rel Release, artifactPath, staged string) error {
 }
 
 func (u *Updater) binaryPath() (string, error) {
-	if u.BinaryPath != "" {
-		return u.BinaryPath, nil
+	if u.Target.Path != "" {
+		return u.Target.Path, nil
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -284,12 +349,12 @@ func (u *Updater) binaryPath() (string, error) {
 // maxBytes resolves MaxBytes into a hard limit, 0 meaning unlimited.
 func (u *Updater) maxBytes() int64 {
 	switch {
-	case u.MaxBytes < 0:
+	case u.Target.MaxBytes < 0:
 		return 0
-	case u.MaxBytes == 0:
+	case u.Target.MaxBytes == 0:
 		return defaultMaxBytes
 	default:
-		return u.MaxBytes
+		return u.Target.MaxBytes
 	}
 }
 
@@ -297,7 +362,7 @@ func (u *Updater) maxBytes() int64 {
 // Reading through io.Copy instead of io.ReadAll is what keeps a 40 MB binary
 // from costing 40 MB of RAM on an embedded target.
 func (u *Updater) download(ctx context.Context, rel Release, path string) (string, error) {
-	client := u.Client
+	client := u.Target.Client
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
@@ -306,17 +371,8 @@ func (u *Updater) download(ctx context.Context, rel Release, path string) (strin
 	if err != nil {
 		return "", fmt.Errorf("update: building request: %w", err)
 	}
-	for name, values := range u.Header {
-		for _, value := range values {
-			req.Header.Set(name, value)
-		}
-	}
-	for name, values := range rel.Header {
-		req.Header.Del(name)
-		for _, value := range values {
-			req.Header.Set(name, value)
-		}
-	}
+	applyHeader(req.Header, u.Auth.HTTPHeader())
+	applyHeader(req.Header, rel.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {

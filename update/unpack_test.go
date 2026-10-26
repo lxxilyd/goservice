@@ -148,11 +148,9 @@ func TestApplyUnpackTarGz(t *testing.T) {
 	}
 
 	updater := &Updater{
-		Source:     &URLSource{URL: srv.URL + "/download/v2.0.0/app.tar.gz", Version: "v2.0.0"},
-		Version:    "v1.0.0",
-		BinaryPath: target,
-		Client:     srv.Client(),
-		Unpack:     TarGz("app"),
+		Source:  &URLSource{URL: srv.URL + "/download/v2.0.0/app.tar.gz", Version: "v2.0.0"},
+		Version: "v1.0.0",
+		Target:  Target{Path: target, Client: srv.Client(), Unpack: TarGz("app")},
 	}
 	if _, err := updater.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v", err)
@@ -179,11 +177,9 @@ func TestApplyMaxBytes(t *testing.T) {
 
 	dir := t.TempDir()
 	updater := &Updater{
-		Source:     &URLSource{URL: srv.URL + "/v2.0.0/app", Version: "v2.0.0"},
-		Version:    "v1.0.0",
-		BinaryPath: filepath.Join(dir, "app"),
-		Client:     srv.Client(),
-		MaxBytes:   100,
+		Source:  &URLSource{URL: srv.URL + "/v2.0.0/app", Version: "v2.0.0"},
+		Version: "v1.0.0",
+		Target:  Target{Path: filepath.Join(dir, "app"), Client: srv.Client(), MaxBytes: 100},
 	}
 	if _, err := updater.Update(context.Background()); err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("oversized artifact error = %v", err)
@@ -202,20 +198,22 @@ func TestApplyVerifyGetsPath(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "app")
 	var seen string
 	updater := &Updater{
-		Source:     &URLSource{URL: srv.URL + "/v2.0.0/app", Version: "v2.0.0"},
-		Version:    "v1.0.0",
-		BinaryPath: target,
-		Client:     srv.Client(),
-		Verify: func(rel Release, path string) error {
-			seen = path
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			if string(data) != "payload" {
-				return io.ErrUnexpectedEOF
-			}
-			return nil
+		Source:  &URLSource{URL: srv.URL + "/v2.0.0/app", Version: "v2.0.0"},
+		Version: "v1.0.0",
+		Target: Target{
+			Path:   target,
+			Client: srv.Client(),
+			Verify: func(rel Release, path string) error {
+				seen = path
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				if string(data) != "payload" {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			},
 		},
 	}
 	if _, err := updater.Update(context.Background()); err != nil {

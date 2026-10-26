@@ -107,7 +107,7 @@ func TestGitHubSourceListFallsBack(t *testing.T) {
 // asset is downloaded through the asset API, because the browser URL redirects
 // to another host and loses the Authorization header on the way.
 func TestGitHubSourcePrivateRelease(t *testing.T) {
-	src := &GitHubSource{Owner: "lxxilyd", Repo: "gottyd", Token: "s3cret"}
+	src := &GitHubSource{Owner: "lxxilyd", Repo: "gottyd", Auth: Auth{Token: "s3cret"}}
 
 	rel := src.release(ghRelease{TagName: "v1.2.3"}, &ghAsset{
 		Name:               "gottyd_linux_amd64",

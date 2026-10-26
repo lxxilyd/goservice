@@ -23,11 +23,13 @@ func TestGitLabSourceEndpoint(t *testing.T) {
 		}
 	}
 
-	if got := (&GitLabSource{}).tokenHeader(); got != "PRIVATE-TOKEN" {
-		t.Fatalf("tokenHeader = %q", got)
+	// A bare token goes in GitLab's own header, an OAuth2 token in
+	// Authorization — the Auth type carries that rule.
+	if got := (Auth{Token: "glpat-1"}).HeaderFor("PRIVATE-TOKEN").Get("PRIVATE-TOKEN"); got != "glpat-1" {
+		t.Fatalf("default token header = %q", got)
 	}
-	if got := (&GitLabSource{TokenHeader: "Authorization"}).tokenHeader(); got != "Authorization" {
-		t.Fatalf("tokenHeader override = %q", got)
+	if got := (Auth{Token: "oauth", Header: "Authorization"}).HeaderFor("PRIVATE-TOKEN").Get("Authorization"); got != "Bearer oauth" {
+		t.Fatalf("Authorization override = %q", got)
 	}
 }
 
@@ -73,7 +75,7 @@ func TestGitLabSourceLatest(t *testing.T) {
 	src := &GitLabSource{
 		Project: "group/gottyd",
 		BaseURL: srv.URL,
-		Token:   "glpat-1",
+		Auth:    Auth{Token: "glpat-1"},
 		Client:  srv.Client(),
 	}
 

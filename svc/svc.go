@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -159,6 +160,93 @@ type Manager interface {
 // New returns the Manager that fits the current machine.
 func New(def Definition) (Manager, error) {
 	return NewWith("", def)
+}
+
+// Do runs one of the commands a daemon's CLI exposes: install, uninstall,
+// start, stop, restart or status. It is the whole body of the usual
+// "gottyd -service=<verb>" switch, so application code does not need to repeat
+// it; status prints one line to out and everything else reports an error.
+func Do(ctx context.Context, manager Manager, command string, out io.Writer) error {
+	switch command {
+	case "install":
+		return manager.Install(ctx)
+	case "uninstall":
+		return manager.Uninstall(ctx)
+	case "start":
+		return manager.Start(ctx)
+	case "stop":
+		return manager.Stop(ctx)
+	case "restart":
+		return manager.Restart(ctx)
+	case "status":
+		status, err := manager.Status(ctx)
+		if err != nil {
+			return err
+		}
+		if out != nil {
+			fmt.Fprintf(out, "%s pid=%d %s\n", status.State, status.PID, status.Detail)
+		}
+		return nil
+	default:
+		return fmt.Errorf("svc: unknown service command %q (want install, uninstall, start, stop, restart or status)", command)
+	}
+}
+
+// ServiceCommand recognises the conventional "<binary> service <verb>" shape —
+// the one cloudflared and most daemons use — and returns the verb together with
+// the remaining arguments, so the rest can become Definition.Args:
+//
+//	["service","install","-p","8080","bash"] -> "install", ["-p","8080","bash"], true
+//	["service"]                              -> "",        nil,                  true
+//	["bash"]                                 -> "",        nil,                  false
+//	["--","service","install"]               -> "",        nil,                  false
+//
+// An empty verb with ok means "service" was given without a command, which is a
+// usage error for the caller to report. A leading "--" opts out, so a daemon
+// whose own command is literally "service" can still run it.
+func ServiceCommand(args []string) (verb string, rest []string, ok bool) {
+	if len(args) == 0 || args[0] != "service" {
+		return "", nil, false
+	}
+	if len(args) < 2 {
+		return "", nil, true
+	}
+	return args[1], append([]string(nil), args[2:]...), true
+}
+
+// StripFlags removes the named flags from an argument list, which is how an
+// application turns its own os.Args into Definition.Args: drop the flags that
+// only made sense on the command line (-service, -d), keep everything else for
+// the unit file.
+//
+// Only the flag token is removed, never the following argument, so a value must
+// be attached: -service=install is stripped, "-service install" is not. A
+// trailing command such as "bash" or its own flags are always preserved.
+func StripFlags(args []string, names ...string) []string {
+	drop := make(map[string]bool, len(names))
+	for _, name := range names {
+		drop[strings.TrimLeft(name, "-")] = true
+	}
+
+	out := make([]string, 0, len(args))
+	for i, arg := range args {
+		if arg == "--" {
+			// Everything after it belongs to the command, flags included.
+			out = append(out, args[i:]...)
+			break
+		}
+		if len(arg) > 1 && arg[0] == '-' {
+			name := strings.TrimLeft(arg, "-")
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				name = name[:eq]
+			}
+			if drop[name] {
+				continue
+			}
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 // NewWith returns the Manager for a named backend instead of the one detected

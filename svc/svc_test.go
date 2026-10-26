@@ -1,6 +1,7 @@
 package svc
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -121,5 +122,130 @@ func TestNewWithBackends(t *testing.T) {
 	}
 	if detected.Backend() == "" {
 		t.Error("the detected backend has no name")
+	}
+}
+
+// TestStripFlags is what turns os.Args into Definition.Args: the service-only
+// flags disappear, the daemon's own flags and its command survive.
+func TestStripFlags(t *testing.T) {
+	cases := []struct {
+		args  []string
+		names []string
+		want  []string
+	}{
+		{
+			args:  []string{"-service=install", "-p", "8080", "-d", "bash", "-l"},
+			names: []string{"service", "d"},
+			want:  []string{"-p", "8080", "bash", "-l"},
+		},
+		{
+			// Only the flag token goes: a detached value is not touched, which
+			// is why -service=install is the documented form.
+			args:  []string{"-service", "install"},
+			names: []string{"service"},
+			want:  []string{"install"},
+		},
+		{
+			// Everything after "--" belongs to command.
+			args:  []string{"-service=install", "--", "-d", "bash"},
+			names: []string{"service", "d"},
+			want:  []string{"--", "-d", "bash"},
+		},
+		{
+			args:  []string{"-p", "8080", "bash"},
+			names: nil,
+			want:  []string{"-p", "8080", "bash"},
+		},
+	}
+
+	for _, tc := range cases {
+		got := StripFlags(tc.args, tc.names...)
+		if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+			t.Errorf("StripFlags(%v) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+// fakeManager records the command Do dispatched.
+type fakeManager struct {
+	called string
+	err    error
+}
+
+func (f *fakeManager) Backend() string        { return "fake" }
+func (f *fakeManager) Definition() Definition { return Definition{} }
+func (f *fakeManager) Install(context.Context) error {
+	f.called = "install"
+	return f.err
+}
+func (f *fakeManager) Uninstall(context.Context) error {
+	f.called = "uninstall"
+	return f.err
+}
+func (f *fakeManager) Start(context.Context) error {
+	f.called = "start"
+	return f.err
+}
+func (f *fakeManager) Stop(context.Context) error {
+	f.called = "stop"
+	return f.err
+}
+func (f *fakeManager) Restart(context.Context) error {
+	f.called = "restart"
+	return f.err
+}
+func (f *fakeManager) Status(context.Context) (Status, error) {
+	f.called = "status"
+	return Status{State: StateRunning, PID: 42, Detail: "unit"}, f.err
+}
+
+func TestDo(t *testing.T) {
+	for _, command := range []string{"install", "uninstall", "start", "stop", "restart"} {
+		manager := &fakeManager{}
+		if err := Do(context.Background(), manager, command, nil); err != nil {
+			t.Fatalf("Do(%q): %v", command, err)
+		}
+		if manager.called != command {
+			t.Fatalf("Do(%q) called %q", command, manager.called)
+		}
+	}
+
+	var out strings.Builder
+	if err := Do(context.Background(), &fakeManager{}, "status", &out); err != nil {
+		t.Fatalf("Do(status): %v", err)
+	}
+	if got := out.String(); got != "running pid=42 unit\n" {
+		t.Fatalf("status line = %q", got)
+	}
+
+	if err := Do(context.Background(), &fakeManager{}, "nope", nil); err == nil {
+		t.Fatal("an unknown service command was accepted")
+	}
+}
+
+// TestServiceCommand covers the "<binary> service <verb>" shape: the verb comes
+// out, the two words disappear, and "--" opts out so a command named "service"
+// can still be run.
+func TestServiceCommand(t *testing.T) {
+	cases := []struct {
+		args     []string
+		wantVerb string
+		wantRest []string
+		wantOk   bool
+	}{
+		{[]string{"service", "install", "-p", "8080", "bash"}, "install", []string{"-p", "8080", "bash"}, true},
+		{[]string{"service", "status"}, "status", []string{}, true},
+		{[]string{"service"}, "", nil, true},
+		{[]string{"bash", "-l"}, "", nil, false},
+		{nil, "", nil, false},
+		{[]string{"--", "service", "install"}, "", nil, false},
+	}
+
+	for _, tc := range cases {
+		verb, rest, ok := ServiceCommand(tc.args)
+		if verb != tc.wantVerb || ok != tc.wantOk || strings.Join(rest, " ") != strings.Join(tc.wantRest, " ") {
+			t.Errorf("ServiceCommand(%v) = (%q, %v, %v), want (%q, %v, %v)",
+				tc.args, verb, rest, ok, tc.wantVerb, tc.wantRest, tc.wantOk)
+		}
 	}
 }

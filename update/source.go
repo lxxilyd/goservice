@@ -39,11 +39,9 @@ type GitHubSource struct {
 	Repo  string
 	// AssetPattern renders the expected asset name for a request.
 	AssetPattern func(Request) string
-	// Token is an optional token, needed for private repositories and useful
-	// against the anonymous rate limit. It is used both to query the release
-	// API and to download the asset, so a private repository updates without
-	// any further wiring.
-	Token string
+	// Auth is used for both the release API and the asset download, so a
+	// private repository needs no further wiring.
+	Auth Auth
 	// IncludePrerelease switches from /releases/latest to the newest /releases.
 	IncludePrerelease bool
 	// BaseURL is the API root of the host. Empty means https://api.github.com;
@@ -87,9 +85,7 @@ func (g *GitHubSource) Latest(ctx context.Context, req Request) (Release, error)
 		return Release{}, err
 	}
 	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if g.Token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+g.Token)
-	}
+	applyHeader(httpReq.Header, g.Auth.HTTPHeader())
 
 	resp, err := g.client().Do(httpReq)
 	if err != nil {
@@ -131,22 +127,23 @@ func (g *GitHubSource) Latest(ctx context.Context, req Request) (Release, error)
 }
 
 // release turns a chosen asset into a downloadable Release and carries the
-// token through to the download, which is what makes a private repository work.
+// credential through to the download, which is what makes a private repository
+// work.
 func (g *GitHubSource) release(rel ghRelease, asset *ghAsset) Release {
-	url := asset.BrowserDownloadURL
-	header := AuthHeader("", g.Token)
+	downloadURL := asset.BrowserDownloadURL
+	header := g.Auth.HTTPHeader()
 	// A private GitHub asset is only reachable through the asset API:
 	// browser_download_url redirects to a signed object URL on another host and
 	// Go drops the Authorization header on a cross-host redirect, so the
 	// download would come back 404. Ask the API for the bytes instead.
 	// Gitea/Forgejo serve the file path itself, so the plain URL is right there.
-	if g.Token != "" && g.BaseURL == "" && asset.URL != "" {
-		url = asset.URL
+	if g.Auth.Token != "" && g.BaseURL == "" && asset.URL != "" {
+		downloadURL = asset.URL
 		header.Set("Accept", "application/octet-stream")
 	}
 	return Release{
 		Version: rel.TagName,
-		URL:     url,
+		URL:     downloadURL,
 		SHA256:  strings.TrimPrefix(asset.Digest, "sha256:"),
 		Notes:   rel.Body,
 		Header:  header,
@@ -191,11 +188,8 @@ type URLSource struct {
 	Version string
 	SHA256  string
 	Notes   string
-	// Token authenticates the download; see AuthHeader for the scheme rules.
-	Token string
-	// Header overrides the Authorization header name (default "Authorization"),
-	// e.g. "PRIVATE-TOKEN" for GitLab or "X-Auth-Token" for an internal service.
-	Header string
+	// Auth authenticates the download.
+	Auth Auth
 }
 
 // versionFromURL returns the version-like token in a URL, for example
@@ -265,7 +259,7 @@ func (s *URLSource) Latest(ctx context.Context, req Request) (Release, error) {
 		URL:     s.URL,
 		SHA256:  strings.TrimPrefix(s.SHA256, "sha256:"),
 		Notes:   s.Notes,
-		Header:  AuthHeader(s.Header, s.Token),
+		Header:  s.Auth.HTTPHeader(),
 	}, nil
 }
 
@@ -276,9 +270,11 @@ func (s *URLSource) Latest(ctx context.Context, req Request) (Release, error) {
 // A relative "url" (starting with "/") is resolved against the feed host, which
 // keeps the feed usable behind a CDN.
 type StaticSource struct {
-	URL    string
-	Token  string
-	Header string
+	URL string
+	// Auth covers the feed and, because the artifact usually sits behind the
+	// same credential, the download too. Write a custom Source if the two need
+	// different credentials.
+	Auth   Auth
 	Client *http.Client
 }
 
@@ -291,13 +287,7 @@ func (s *StaticSource) Latest(ctx context.Context, req Request) (Release, error)
 	if err != nil {
 		return Release{}, err
 	}
-	if s.Token != "" {
-		header := s.Header
-		if header == "" {
-			header = "Authorization"
-		}
-		httpReq.Header.Set(header, s.Token)
-	}
+	applyHeader(httpReq.Header, s.Auth.HTTPHeader())
 
 	client := s.Client
 	if client == nil {
@@ -337,6 +327,7 @@ func (s *StaticSource) Latest(ctx context.Context, req Request) (Release, error)
 		URL:     payload.URL,
 		SHA256:  strings.TrimPrefix(payload.SHA256, "sha256:"),
 		Notes:   payload.Notes,
+		Header:  s.Auth.HTTPHeader(),
 	}, nil
 }
 

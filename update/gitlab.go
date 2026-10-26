@@ -45,13 +45,11 @@ type GitLabSource struct {
 	// BaseURL is the API root. Empty means https://gitlab.com/api/v4; a bare
 	// instance URL without "/api/v4" gets it appended.
 	BaseURL string
-	// Token is a personal, project or group access token. It authenticates
-	// both the API call and the download, so private projects update with no
-	// further wiring.
-	Token string
-	// TokenHeader overrides the header carrying Token, default "PRIVATE-TOKEN".
-	// Use "Authorization" for an OAuth2 token.
-	TokenHeader string
+	// Auth is used for both the release API and the download, which is what
+	// makes a private project work. A personal access token goes in
+	// "PRIVATE-TOKEN" (the default); an OAuth2 token sets Header to
+	// "Authorization".
+	Auth Auth
 	// AssetPattern renders the expected asset name for a request.
 	AssetPattern func(Request) string
 	// IncludePrerelease switches from /releases/latest to the newest /releases,
@@ -69,13 +67,6 @@ func (g *GitLabSource) endpoint() string {
 		base += "/api/v4"
 	}
 	return base
-}
-
-func (g *GitLabSource) tokenHeader() string {
-	if g.TokenHeader != "" {
-		return g.TokenHeader
-	}
-	return "PRIVATE-TOKEN"
 }
 
 func (g *GitLabSource) client() *http.Client {
@@ -112,9 +103,7 @@ func (g *GitLabSource) Latest(ctx context.Context, req Request) (Release, error)
 		return Release{}, err
 	}
 	httpReq.Header.Set("Accept", "application/json")
-	if g.Token != "" {
-		httpReq.Header.Set(g.tokenHeader(), g.Token)
-	}
+	applyHeader(httpReq.Header, g.Auth.HeaderFor("PRIVATE-TOKEN"))
 
 	resp, err := g.client().Do(httpReq)
 	if err != nil {
@@ -175,7 +164,7 @@ func (g *GitLabSource) release(rel glRelease, link *glLink) Release {
 		Version: rel.TagName,
 		URL:     downloadURL,
 		Notes:   rel.Description,
-		Header:  AuthHeader(g.tokenHeader(), g.Token),
+		Header:  g.Auth.HeaderFor("PRIVATE-TOKEN"),
 	}
 }
 

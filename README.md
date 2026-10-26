@@ -9,7 +9,8 @@
 ```
 goservice/
 ├── svc/       安装 / 卸载 / 启动 / 停止 / 重启 / 状态
-└── update/    版本检查、校验后下载、原子替换、重启
+├── update/    版本检查、流式下载与校验、解包、原子替换、重启
+└── daemon/    把上面两者合成 main 里的一次调用（service <verb>）
 ```
 
 ## 平台支持
@@ -50,6 +51,72 @@ status, err := manager.Status(ctx)    // State、PID、后端细节
 
 `svc.NotifyReady()` / `NotifyStopping()` 在非 Linux 平台是空操作，只要设了 `Definition.Notify` 就可以无条件调用。
 
+### 二进制放哪：集成方的事
+
+`ExecPath` 留空时取**当前运行的那个二进制**（解析符号链接后）。这只是便利，不是推荐做法：`svc` 不会替你复制任何文件，从 `~/Downloads` 或 `/tmp/build` 跑一次 `install`，unit 就永久指向那里，目录一清服务就起不来。
+
+生产安装应由安装脚本或包管理器先把二进制放到稳定路径（`/usr/local/bin/<name>`、`%ProgramFiles%\<Name>\<name>.exe`），再显式设置 `Definition.ExecPath`，并让 `update.Target.Path` 指向同一个文件——两处不一致时，自更新会替换到另一个路径去。
+
+还有一点：已安装后从另一个路径再执行一次 `install`，Linux/BSD 会把 unit 改指新路径，Windows 不会（`BinaryPathName` 不在更新的字段里）。想换路径，先 `uninstall` 再 `install` 更可预期。
+
+### 集成：main 里一次调用
+
+`daemon` 包把“认服务命令、装/管服务、自更新”合成一个调用，配置就是三个字段：
+
+```go
+// mydaemon service install|uninstall|start|stop|restart|status|update
+handled, err := daemon.Handle(ctx, flag.Args(), daemon.Config{
+	Service: svc.Definition{
+		Name:      "mydaemon",
+		ExecPath:  "/usr/local/bin/mydaemon", // 见上文“二进制放哪”
+		Restart:   true,
+		AutoStart: true,
+	},
+	Source:  &update.GitHubSource{Owner: "you", Repo: "mydaemon"}, // 有它才有 service update
+	Version: version,
+})
+if handled {
+	return err // 服务命令已经执行完
+}
+// 不是服务命令（比如 `mydaemon run`），继续自己的逻辑
+```
+
+几个默认值省掉了大部分胶水：
+
+- `Service.Args` 为空时，`service <verb>` **之后**的参数成为服务命令行（`mydaemon service install -p 8080 bash` → unit 里就是 `-p 8080 bash`）；`Config.Strip` 指定哪些 flag 不该带进去（如 `-d`）。
+- 自更新的落点 `Config.Target.Path` 默认取 `Service.ExecPath`，不会出现“更新替换了另一个文件”。
+- 服务没装时执行 `service update` 不会报错，只更新二进制，重启那步自动跳过。
+- 输出走 `Config.Out`（默认 stdout）：`status` 一行、`update` 一行 `updated a -> b`。
+
+只用其中一个包也行：不引 `daemon`，直接用 `svc.New` / `svc.Do` 或 `update.Updater`。`daemon` 是最厚的一层，它同时依赖 `svc` 和 `update`（也就是会链接 `net/http`），只要服务管理的话别引它。
+
+### 不用 `daemon` 包时
+
+三行等价的底层写法，适合想自己控制流程的场景：
+
+```go
+// mydaemon service install|uninstall|start|stop|restart|status
+if verb, rest, ok := svc.ServiceCommand(flag.Args()); ok {
+	manager, err := svc.New(svc.Definition{
+		Name:      "mydaemon",
+		ExecPath:  "/usr/local/bin/mydaemon",
+		Args:      svc.StripFlags(rest, "d"),
+		Restart:   true,
+		AutoStart: true,
+	})
+	if err != nil {
+		return err
+	}
+	return svc.Do(ctx, manager, verb, os.Stdout)
+}
+```
+
+- `svc.ServiceCommand` 认 `service <verb>`，返回动词和剩下的参数；`--` 可以逃逸，所以要执行一个真叫 `service` 的命令仍然可以。
+- `svc.StripFlags` 只移除 flag 本身、不碰后面的参数，所以值要写成 `-flag=value`。
+- `svc.Do` 分发六个动词，`status` 打一行。
+
+如果应用的第一个位置参数就是“要执行的命令”（gottyd 就是），这段要放在“必须有命令”的校验**之前**。不想占用位置参数，也可以用 flag 形态（`-service=install`），`Do` 一样接。
+
 ### 指定后端
 
 自动探测基本够用，但有时你就是要那一个：在 systemd 的机器上生成一份 SysV 脚本做对照、探测失败的定制固件上明确走 procd、或者在测试里只验证某个后端的产物。
@@ -71,96 +138,111 @@ fmt.Println(svc.Backends())                // 这个构建里有哪些后端，�
 
 ## 自更新
 
+一次更新只有三件事，`Updater` 的字段就是按这三步排的：
+
+| 阶段 | 字段 | 管什么 |
+| --- | --- | --- |
+| 发现 | `Source` `Version` `Channel` | 最新版本从哪来、当前是什么、走哪个通道 |
+| 安装 | `Auth` `Target` | 凭据、装到哪个路径、大小上限、校验、解包 |
+| 收尾 | `Restart` `Managed` | 装完怎么重启、什么时候禁止自更新 |
+
 ```go
-updater := &update.Updater{
-	Source:  &update.GitHubSource{Owner: "you", Repo: "mydaemon"},
+up := &update.Updater{
+	Source:  &update.GitHubSource{Owner: "you", Repo: "mydaemon", Auth: update.Auth{Token: cfg.Token}},
 	Version: version,
-	Restart: manager.Restart,   // 替换完成后由新二进制接管
+	Target: update.Target{
+		Path:   "/usr/local/bin/mydaemon", // 装到哪；留空 = 当前运行的二进制
+		Unpack: update.TarGz("mydaemon"),  // 发行包是压缩包时才需要
+	},
+	Restart: manager.Restart, // 替换完成后由新二进制接管
 }
-result, err := updater.Update(ctx)   // 无新版本时返回 update.ErrUpToDate
+result, err := up.Update(ctx) // 无新版本时返回 update.ErrUpToDate
 ```
 
-### 自建 Git（Gitea / Forgejo）
+`Auth` 只有一处：查询 release 和下载产物都用它。`Target.Path` 建议显式写成**已安装的那个路径**（和 `svc.Definition.ExecPath` 一致），不要依赖默认值——否则从临时目录跑一次更新，就把二进制替换到临时目录去了。
 
-`GitHubSource` 不只服务 GitHub：它的 release API 路径与 Gitea/Forgejo 一致，改 `BaseURL` 即可（分页参数 `per_page` / `limit` 的差异已内部处理）。
+### 四种 Source，选一个
+
+**① GitHub / 自建 Gitea / Forgejo**
 
 ```go
 &update.GitHubSource{
 	Owner:   "lxxilyd",
 	Repo:    "gottyd",
-	BaseURL: "https://git.example.com/api/v1", // 自建 Gitea/Forgejo 的 API 根
-	Token:   cfg.Token,                        // 私有库：查询和下载都用它
+	BaseURL: "https://git.example.com/api/v1", // 自建时填，GitHub 留空
+	Auth:    update.Auth{Token: cfg.Token},    // 私有库：查询和下载都用
 }
 ```
 
-`Token` 同时用于查询 release 和下载产物。用 GitHub 私有库时会自动改用 asset API 地址并带 `Accept: application/octet-stream` —— 因为 `browser_download_url` 会跳转到另一个域名，Go 在跨域跳转时会丢掉 `Authorization`，直接下会 404。
+release API 路径与 Gitea/Forgejo 完全一致，分页参数 `per_page` / `limit` 的差异已内部处理。GitHub 私有库会自动改用 asset API 地址并带 `Accept: application/octet-stream` —— `browser_download_url` 会跨域跳转，Go 会丢掉 `Authorization`，直接下是 404。
 
-### GitLab（gitlab.com 或自建）
+**② GitLab（gitlab.com 或自建）**
 
-GitLab 的 release API 和 GitHub 完全不是一套（项目按 ID 或完整路径寻址、文件挂在 `assets.links` 下、描述字段叫 `description`），所以是独立的源，而不是 `BaseURL` 的开关：
+GitLab 的 API 形状和 GitHub 完全不同（项目按 ID 或完整路径寻址、文件挂在 `assets.links` 下、描述字段叫 `description`），所以是独立的源：
 
 ```go
 &update.GitLabSource{
-	Project: "group/gottyd",                    // 也可以写数字 ID；斜杠会自动编码成 %2F
-	// BaseURL: "https://gitlab.example.com",   // 不写 /api/v4 会自动补上
-	Token: cfg.Token,                           // PAT / project / group token，查询和下载都用
-	// TokenHeader: "Authorization",            // OAuth2 token 时改这里，默认 PRIVATE-TOKEN
-	// AssetPattern: func(req update.Request) string { return ... }, // 用数字 ID 时必须给
+	Project: "group/gottyd",                 // 数字 ID 也行；斜杠自动编码成 %2F
+	// BaseURL: "https://gitlab.example.com", // 不写 /api/v4 会自动补上
+	Auth: update.Auth{Token: cfg.Token},     // 默认走 PRIVATE-TOKEN
+	// Auth: update.Auth{Token: oauth, Header: "Authorization"}, // OAuth2 token
+	// AssetPattern: func(req update.Request) string { return ... }, // 数字 ID 时必须给
 }
 ```
 
-下载优先取 `direct_asset_url`（GitLab 自己签的永久下载路径，私有库靠它），没有才退回 `url`。默认资产名是 `<项目名>_<os>_<arch>`，其中项目名取路径最后一段；用数字 ID 时拼不出名字，请设 `AssetPattern`。`IncludePrerelease` 走 `/releases` 列表，未来日期的预发布也一并可见，列表同样会往下找第一个含本平台资产的 release。
+下载优先取 `direct_asset_url`（GitLab 自己签的永久下载路径，私有库靠它），没有才退回 `url`。默认资产名是 `<项目名>_<os>_<arch>`，项目名取路径最后一段；用数字 ID 时拼不出名字，请设 `AssetPattern`。`IncludePrerelease` 走 `/releases` 列表，未来日期的预发布也可见，列表同样会往下找第一个含本平台资产的 release。
 
-### 任意下载地址
-
-想直接给一个下载链接（自建 git 的下载路径、对象存储、CDN、内网文件服务器都行）：
+**③ 任意下载地址**
 
 ```go
-updater := &update.Updater{
-	Source: &update.URLSource{
-		URL:     "https://git.example.com/lxxilyd/gottyd/releases/download/v2026.10.23/gottyd_linux_amd64",
-		Token:   cfg.Token,             // 需要鉴权时填，会带在下载请求上
-		// Header: "PRIVATE-TOKEN",     // 自定义鉴权头名，默认 Authorization
-		// SHA256: "...",               // 可选：有校验值就校
-	},
-	Version: version,
-	Restart: manager.Restart,
+&update.URLSource{
+	URL:     "https://dl.example.com/gottyd_linux_amd64",
+	Version: "v2026.10.23",                 // 不填则从链接里按三段数字提取
+	Auth:    update.Auth{Token: cfg.Token}, // 可选
+	// SHA256: "...",                       // 可选：有校验值就校
 }
 ```
 
-`Version` 不填时从链接里按“三段数字”的规则提取，例如上面的链接解析出 `v2026.10.23`；提取不到会直接报错，要求显式指定。
-
-如果不希望客户端自己判断版本，可以让服务端出一份 JSON：
+⚠️ 这里的链接必须是“指向最新”的稳定地址。**如果链接里带版本号，`Update()` 会永远判定已是最新**（版本比较相等），这种场景要用 `Apply` 直接覆盖安装：
 
 ```go
-&update.StaticSource{URL: "https://example.com/latest.json"}
+rel, err := up.Source.Latest(ctx, update.CurrentPlatform(version, ""))
+result, err := up.Apply(ctx, rel) // 跳过版本比较
+```
+
+**④ JSON feed（版本由服务端决定）**
+
+```go
+&update.StaticSource{
+	URL:  "https://example.com/latest.json",
+	Auth: update.Auth{Token: cfg.Token}, // feed 和产物共用同一个凭据
+}
 // {"version": "1.4.2", "url": "https://example.com/app", "sha256": "..."}
 // url 以 "/" 开头时按 feed 所在域解析，方便挂在 CDN 后面
 ```
 
-### 鉴权头
+### 凭据（Auth）
 
-两条通道都能带鉴权，共用一个 `AuthHeader` 构造：
+一个类型、一处配置，查询和下载两跳通用：
 
 ```go
-release.Header = update.AuthHeader("", "glpat-xxx")              // Authorization: Bearer glpat-xxx
-release.Header = update.AuthHeader("PRIVATE-TOKEN", "glpat-xxx") // PRIVATE-TOKEN: glpat-xxx
-release.Header = update.AuthHeader("", "token 0123abcd")          // 已带 scheme 时原样发送
+update.Auth{Token: "glpat-x"}                          // Authorization: Bearer glpat-x
+update.Auth{Token: "glpat-x", Header: "PRIVATE-TOKEN"} // PRIVATE-TOKEN: glpat-x
+update.Auth{Token: "token 0123"}                       // 已带 scheme 时原样发送
 ```
 
-优先级：`Release.Header` > `Updater.Header`（后者适合“所有产物共用一个凭据”的场景，自定义 `Source` 也能用）。`Updater.Client` 可换成带 mTLS 或自定义代理的 client。
+自己写 `Source` 时不用手动拼 header：`Updater.Auth` 会自动加到下载请求上；也可以在自己的 `Source` 里用 `Auth.HTTPHeader()` 得到同样的结果并放进 `Release.Header`。`Target.Client` 可换成带 mTLS 或自定义代理的 client。
 
 ### 解包（tar.gz / zip）
 
-默认把下载到的字节直接当二进制用。发行包是压缩包时，挂一个 `Unpack` 钩子即可——它拿到的只是 `io.Reader`，写出来的才是要装的可执行文件：
+默认把下载到的字节直接当二进制用。发行包是压缩包时，给 `Target.Unpack` 挂个钩子——它拿到的只是 `io.Reader`，写出来的才是要装的可执行文件：
 
 ```go
-updater := &update.Updater{
-	Source: &update.GitHubSource{Owner: "you", Repo: "mydaemon"},
+Target: update.Target{
 	// 从 app_1.2.3_linux_amd64/app 里取，也接受扁平命名的 app_linux_amd64
 	Unpack: update.TarGz("app"),
 	// Unpack: update.Zip("app.exe"),
-}
+},
 ```
 
 `TarGz` / `Zip` 先按完整路径匹配成员名，再按 basename 兜底；找不到时报错会列出包里实际的文件名。`Zip` 需要产物是 `*os.File`（`Updater` 传进去的始终是），因为 zip 要随机读取。
@@ -173,15 +255,26 @@ Unpack: func(rel update.Release, artifact io.Reader, w io.Writer) error {
 }
 ```
 
-校验发生在解包**之前**：`Release.SHA256` 是产物的摘要，不是里面二进制的摘要，所以校验通过后才解包。
+校验发生在解包**之前**：`Release.SHA256` 是产物的摘要，不是里面二进制的摘要。
 
 ### 大小上限
 
-`Updater.MaxBytes` 默认 512 MiB，负值表示不限。下载是流式的（`io.Copy` + 边下边算 SHA-256 写 `<binary>.part`），不是 `io.ReadAll`，所以 40 MB 的二进制只占几十 KB 的缓冲——路由器上尤其重要。
+`Target.MaxBytes` 默认 512 MiB，负值表示不限。下载是流式的（`io.Copy` + 边下边算 SHA-256 写 `<binary>.part`），不是 `io.ReadAll`，所以 40 MB 的二进制只占几十 KB 的缓冲——路由器上尤其重要。
+
+### 集成清单
+
+按顺序确定下面几项，接完就能用（用 `daemon.Handle` 的话，1~5 一次调用就包含在内）：
+
+1. **Source** —— 有 git 仓库就用 `GitHubSource` / `GitLabSource`；只有一个文件地址就用 `URLSource`（记住带版本号的链接只能 `Apply`）；想让服务端决定版本就用 `StaticSource`。
+2. **Auth** —— 只有私有源才需要填，一处配置两跳通用。
+3. **Target.Path** —— 必须是安装后的稳定路径，和 `svc.Definition.ExecPath` 保持一致；生产环境不要留空。
+4. **Target.Unpack / Target.Verify** —— 发行包是压缩包就挂解包钩子；有签名就再加一道校验。
+5. **Restart** —— 接 `manager.Restart`，否则新二进制装上了但没人拉起。
+6. **启动时** —— 调一次 `update.CleanupOldBinary("")`（Windows 清理 `.old`，其它平台空操作）。
 
 ### 其余行为
 
-替换会先把产物落到同目录的 `<binary>.part`，校验/解包后成为 `<binary>.new`，最后 rename 到位，中间任何一步崩掉都不会留下半个二进制。release 带 SHA-256 时自动校验；`Updater.Verify` 拿的是**产物路径**（不是内存里的字节，大文件也能用），适合再做一道签名校验。`Updater.Managed` 返回真时拒绝自更新，把升级交给包管理器。`update.CleanupOldBinary` 用于清理 Windows 自更新留下的 `.old` 文件，启动时调一次即可。
+替换会先把产物落到同目录的 `<binary>.part`，校验/解包后成为 `<binary>.new`，最后 rename 到位，中间任何一步崩掉都不会留下半个二进制。release 带 SHA-256 时自动校验；`Target.Verify` 拿的是**产物路径**（不是内存里的字节，大文件也能用），适合再做一道签名校验。`Updater.Managed` 返回真时拒绝自更新，把升级交给包管理器。`update.CleanupOldBinary` 用于清理 Windows 自更新留下的 `.old` 文件，启动时调一次即可。
 
 ## Windows Server：这里已经处理掉的坑
 
@@ -208,7 +301,7 @@ cloudflared 在 Windows 服务上踩过一串问题，以下都是有意修掉�
 
 ## 在别的模块里使用
 
-模块路径有意取短（`module github.com/lxxilyd/goservice`）。本地开发加 `go.work` 或 replace 指令即可：
+模块路径是 `github.com/lxxilyd/goservice`。本地开发加 `go.work` 或 replace 指令即可：
 
 ```
 require github.com/lxxilyd/goservice v0.0.0
@@ -222,7 +315,7 @@ go test ./...                                  # 单元测试，不需要任何�
 GOOS=linux GOARCH=mipsle go build ./...        # 以及其它目标平台
 ```
 
-`svc` 的 5 个后端都要真正写出文件，所以它们的渲染函数放在没有 build tag 的 `render.go` 里，由 `svc/testdata/*.golden` 逐个比对生成的 unit、SysV/procd/rc.d 脚本和 plist —— 在任何一台机器上跑测试都能发现"改了模板改坏了"。`TestRenderIsStable` 还会反复渲染，防止 `Definition.Env`（map）导致每次安装写出不同顺序的文件。
+`svc` 有 6 个后端，其中 5 个要真正写出文件（Windows 走 SCM API，不生成文件），所以它们的渲染函数放在没有 build tag 的 `render.go` 里，由 `svc/testdata/*.golden` 逐个比对生成的 unit、SysV/procd/rc.d 脚本和 plist —— 在任何一台机器上跑测试都能发现“改了模板改坏了”。`TestRenderIsStable` 还会反复渲染，防止 `Definition.Env`（map）导致每次安装写出不同顺序的文件。
 
 改模板后重新生成：
 
@@ -233,11 +326,12 @@ UPDATE_GOLDEN=1 go test ./svc
 `examples/agent` 是一个可直接跑的守护进程，能把自己装成服务并自更新，是了解接线方式最快的入口：
 
 ```
-agent backends                                                                   # 本平台可用的后端
-agent -backend sysv install                                                      # 指定后端写文件
-agent -repo you/repo update                                                      # GitHub
-agent -repo you/repo -base-url https://git.example.com/api/v1 -token T update    # 自建 Gitea
-agent -gitlab group/app -base-url https://gitlab.example.com -token T update      # GitLab
-agent -url https://dl.example.com/app_linux_amd64 -remote-version v1.2.3 update  # 任意下载地址
-agent -repo you/repo -unpack app update                                          # 从 tar.gz/zip 里取 app
+agent backends                                                                    # 本平台可用的后端
+agent -backend sysv service install                                               # 指定后端写文件
+agent service status                                                              # running pid=... 一行
+agent -repo you/repo service update                                               # GitHub
+agent -repo you/repo -base-url https://git.example.com/api/v1 -token T service update  # 自建 Gitea
+agent -gitlab group/app -base-url https://gitlab.example.com service update       # GitLab
+agent -url https://dl.example.com/app_linux_amd64 -remote-version v1.2.3 service update # 任意地址
+agent -repo you/repo -unpack app service update                                   # 从 tar.gz/zip 取 app
 ```
