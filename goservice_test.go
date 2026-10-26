@@ -4,9 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-
-	"github.com/lxxilyd/goservice/svc"
-	"github.com/lxxilyd/goservice/update"
 )
 
 // TestHandleIgnoresOtherCommands is the contract the caller depends on: anything
@@ -31,7 +28,7 @@ func TestHandleUsageAndUnknownVerb(t *testing.T) {
 	if !handled || err == nil {
 		t.Fatalf("bare service = (%v, %v), want an error", handled, err)
 	}
-	if !strings.Contains(err.Error(), "install") || !strings.Contains(err.Error(), "update") {
+	if !strings.Contains(err.Error(), "install") || !strings.Contains(err.Error(), "status") {
 		t.Fatalf("usage error = %q, want the verb list", err)
 	}
 
@@ -44,41 +41,10 @@ func TestHandleUsageAndUnknownVerb(t *testing.T) {
 	if !handled || err == nil || !strings.Contains(err.Error(), "installl") {
 		t.Fatalf("unknown verb = (%v, %v)", handled, err)
 	}
-}
 
-// TestHandleUpdateNeedsSource keeps the failure readable instead of letting it
-// surface as a nil pointer later.
-func TestHandleUpdateNeedsSource(t *testing.T) {
-	handled, err := Handle(context.Background(), []string{"service", "update"}, Config{})
-	if !handled || err == nil || !strings.Contains(err.Error(), "Config.Source") {
-		t.Fatalf("update without a source = (%v, %v)", handled, err)
+	// Self-update is not part of this module any more.
+	handled, err = Handle(context.Background(), []string{"service", "update"}, Config{})
+	if !handled || err == nil || !strings.Contains(err.Error(), "update") {
+		t.Fatalf("removed update verb = (%v, %v)", handled, err)
 	}
-}
-
-// TestHandleWritesToOut proves the status output goes where the caller asked,
-// using a source that reports the running version so the update stops before it
-// downloads or touches any backend state.
-func TestHandleWritesToOut(t *testing.T) {
-	var out strings.Builder
-	cfg := Config{
-		Service: svc.Definition{Name: "testdaemon", ExecPath: "/bin/true"},
-		Source:  upToDateSource{},
-		Version: "v1.0.0",
-		Out:     &out,
-	}
-	handled, err := Handle(context.Background(), []string{"service", "update"}, cfg)
-	if !handled || err != nil {
-		t.Fatalf("Handle = (%v, %v)", handled, err)
-	}
-	if got := out.String(); got != "already up to date (v1.0.0)\n" {
-		t.Fatalf("output = %q", got)
-	}
-}
-
-// upToDateSource reports the running version, so Update stops at ErrUpToDate
-// before it downloads or replaces anything.
-type upToDateSource struct{}
-
-func (upToDateSource) Latest(context.Context, update.Request) (update.Release, error) {
-	return update.Release{Version: "v1.0.0"}, nil
 }

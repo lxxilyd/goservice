@@ -1,22 +1,19 @@
 # goservice
 
-Install a Go daemon as a native system service, and keep it up to date — with no
-CLI framework, logging library or application dependency.
+Install a Go daemon as a native system service — with no CLI framework, logging
+library or application dependency.
 
 **Language: [中文](README.md) · [English](README.en.md)**
 
 ```
 goservice.Handle(...)   root package: one call in main, `service <verb>` on the CLI
 svc/                    service: install / uninstall / start / stop / restart / status
-update/                 self-update: version check, streamed download, verify, unpack, replace
 ```
 
 ## Quick start
 
 ```go
 func main() {
-	_ = update.CleanupOldBinary("") // Windows: drop the .old from the last update
-
 	handled, err := goservice.Handle(context.Background(), flag.Args(), goservice.Config{
 		Service: svc.Definition{
 			Name:      "mydaemon",
@@ -25,25 +22,23 @@ func main() {
 			Restart:   true,
 			AutoStart: true,
 		},
-		Source:  &update.GitHubSource{Owner: "you", Repo: "mydaemon"}, // enables service update
-		Version: version, // injected at build time: -ldflags "-X main.version=1.2.3"
 	})
 	if handled {
 		if err != nil {
 			log.Fatal(err)
 		}
-		return // install / status / update already ran
+		return // install / status already ran
 	}
 
 	// not a service command: do the daemon's own work
 }
 ```
 
-Import `github.com/lxxilyd/goservice`; the package is also called `goservice`. CLI: `mydaemon service install|uninstall|start|stop|restart|status|update`.
+Import `github.com/lxxilyd/goservice`; the package is also called `goservice`.
+CLI: `mydaemon service install|uninstall|start|stop|restart|status`.
 
-Need only half of it? Skip the root package: `svc.New` + `svc.Do` for service
-management, `update.Updater` for self-update. The root package links both,
-`net/http` included.
+Prefer your own flow? Use `svc` directly: `svc.New(def)` and
+`svc.Do(ctx, manager, verb, os.Stdout)`.
 
 ## Platforms
 
@@ -64,48 +59,20 @@ lists what this build offers. `Env` / `WorkingDir` / `LogDir` are only honoured 
 some backends (Windows supports none of the three, `rcd` all three missing,
 systemd logs to the journal) and are **silently ignored** elsewhere.
 
-## Self-update
+## Service definition notes
 
-`Source` decides where versions come from, `Auth` is configured once and used for
-both the lookup and the download, `Target` decides where it goes and how it is
-verified.
-
-| Source | Use it when |
-| --- | --- |
-| `GitHubSource` | GitHub, or self-hosted Gitea/Forgejo (`BaseURL` accepts the site root or `.../api/v1`; `/api/v1` is appended when missing) |
-| `GitLabSource` | gitlab.com or self-hosted GitLab (`Project: "group/app"`, `PRIVATE-TOKEN` by default) |
-| `URLSource` | any download URL; it must point at the **latest** build — a versioned link only works with `Apply` |
-| `StaticSource` | the server publishes `{"version","url","sha256"}` and owns the version |
-
-```go
-up := &update.Updater{
-	Source:  &update.GitHubSource{Owner: "you", Repo: "mydaemon", Auth: update.Auth{Token: cfg.Token}},
-	Version: version,
-	Target: update.Target{
-		Path:   "/usr/local/bin/mydaemon", // defaults to the running binary; set it in production
-		Unpack: update.TarGz("mydaemon"),  // only when the release is a tar.gz/zip
-	},
-	Restart: manager.Restart, // the new binary takes over after the replace
-}
-result, err := up.Update(ctx) // update.ErrUpToDate when nothing to do
-```
-
-- **Credentials**: `update.Auth{Token: "..."}` sends `Authorization: Bearer`; a
-  GitLab PAT uses `PRIVATE-TOKEN` automatically; `Header` overrides the name.
-- **Asset names**: the default pattern is `<repo>_<os>_<arch>`, and `-` vs `_`
-  plus `.exe`/`.tar.gz` style suffixes are ignored, so `gottyd-windows-amd64.exe`
-  just matches. Matching never crosses architectures (`gottyd_linux_arm` will not
-  pick `gottyd_linux_arm64`); use `AssetPattern` when the naming is irregular.
-- **Unpacking**: `update.TarGz("member")` / `update.Zip("member")`, or your own
-  `func(rel, io.Reader, io.Writer) error`. Verification runs before unpacking.
-- **Size and safety**: `Target.MaxBytes` defaults to 512 MiB (negative disables),
-  the download is streamed so memory stays flat; `Target.Verify` receives the
-  artifact path for a signature check.
-- **Replacement**: `<binary>.part` → verified/unpacked into `<binary>.new` →
-  renamed into place, so a crash never leaves half a binary.
-
-## Windows and embedded notes
-
+- **Set `ExecPath` explicitly**: empty means "the binary running right now"
+  (symlinks resolved), which is a convenience, not a recommendation. `svc` never
+  copies anything, so installing from `/tmp` or a download directory writes a
+  unit pointing there forever. Put the binary at a stable path first
+  (`/usr/local/bin/<name>`, `%ProgramFiles%\<Name>\<name>.exe`), then set it.
+- **Moving a service**: re-running `install` from another path rewrites the unit
+  on Linux/BSD while Windows keeps the original `BinaryPathName` (it is not in
+  the updated fields). `uninstall` then `install` is predictable everywhere.
+- **Argument snapshot**: when `Service.Args` is empty, the arguments after
+  `service <verb>` become the service command line
+  (`mydaemon service install -p 8080 bash`); `Config.Strip` names the flags that
+  must not be copied (`-d`). Flags meant for the service go after the verb.
 - **Windows**: the event log is best effort (it never rolls the service back);
   `CreateService` is called without a description so x/sys cannot delete a
   half-installed service; `Status().Detail` reports the real `BinaryPathName`,
@@ -132,6 +99,5 @@ platform. `examples/agent` is a runnable daemon:
 agent backends                                  # backends this build has
 agent -backend sysv service install             # write a specific backend's files
 agent service status                            # running pid=...
-agent -repo you/repo service update             # self-update from GitHub
-agent -repo you/repo -unpack app service update # take app out of a tar.gz/zip
+agent service uninstall
 ```

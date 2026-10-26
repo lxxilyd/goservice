@@ -1,18 +1,16 @@
 // Package goservice is the one call an application's main needs: it recognises
-// "service <verb>" on the command line and does the right thing (install,
-// uninstall, start, stop, restart, status or self-update), or reports that the
-// arguments are not a service command so the application carries on.
+// "service <verb>" on the command line and manages the service (install,
+// uninstall, start, stop, restart, status), or reports that the arguments are
+// not a service command so the application carries on.
 //
 // It exists so that integrating a daemon does not mean pasting the same twenty
-// lines of dispatch, argv handling and restart plumbing into every main. It
-// depends on both svc and update; an application that wants only one of them
-// should use that package directly, since importing this one pulls both.
+// lines of dispatch and argv handling into every main. It is a thin layer over
+// the svc package: an application that wants more control can call svc.New and
+// svc.Do directly.
 //
 //	func main() {
 //		handled, err := goservice.Handle(ctx, flag.Args(), goservice.Config{
 //			Service: svc.Definition{Name: "gottyd", ExecPath: "/usr/local/bin/gottyd", Restart: true, AutoStart: true},
-//			Source:  &update.GitHubSource{Owner: "lxxilyd", Repo: "gottyd"},
-//			Version: Version,
 //		})
 //		if handled {
 //			exit(err)
@@ -29,11 +27,10 @@ import (
 	"os"
 
 	"github.com/lxxilyd/goservice/svc"
-	"github.com/lxxilyd/goservice/update"
 )
 
 // verbs are the service commands Handle accepts.
-var verbs = []string{"install", "uninstall", "start", "stop", "restart", "status", "update"}
+var verbs = []string{"install", "uninstall", "start", "stop", "restart", "status"}
 
 // Config describes the daemon behind the "service" subcommand.
 type Config struct {
@@ -43,15 +40,6 @@ type Config struct {
 	// Backend forces a specific service backend instead of detecting one, and
 	// is passed to svc.NewWith. Empty means detection.
 	Backend string
-
-	// Source enables "service update". Nil means that verb is not offered.
-	Source  update.Source
-	Version string
-	Channel string
-	Auth    update.Auth
-	// Target says how the artifact is verified and unpacked. Path defaults to
-	// Service.ExecPath, which is the value an update must replace.
-	Target update.Target
 
 	// Strip names the flags that belong to the CLI only (-d, -logdir, ...) and
 	// must not be copied into the installed command line. It only applies when
@@ -87,8 +75,6 @@ func Handle(ctx context.Context, args []string, cfg Config) (handled bool, err e
 		return true, errors.New(cfg.usage())
 	case !knownVerb(verb):
 		return true, fmt.Errorf("goservice: unknown service command %q, want one of: %s", verb, joinVerbs())
-	case verb == "update" && cfg.Source == nil:
-		return true, errors.New(`goservice: "service update" needs Config.Source`)
 	}
 
 	def := cfg.Service
@@ -102,40 +88,7 @@ func Handle(ctx context.Context, args []string, cfg Config) (handled bool, err e
 	if err != nil {
 		return true, err
 	}
-	if verb != "update" {
-		return true, svc.Do(ctx, manager, verb, out)
-	}
-
-	target := cfg.Target
-	if target.Path == "" {
-		target.Path = def.ExecPath
-	}
-	updater := &update.Updater{
-		Source:  cfg.Source,
-		Version: cfg.Version,
-		Channel: cfg.Channel,
-		Auth:    cfg.Auth,
-		Target:  target,
-		Restart: func(ctx context.Context) error {
-			// Updating a binary that is not installed as a service is a normal
-			// case, not a failure to restart something.
-			if err := manager.Restart(ctx); err != nil && !errors.Is(err, svc.ErrNotInstalled) {
-				return err
-			}
-			return nil
-		},
-	}
-
-	result, err := updater.Update(ctx)
-	switch {
-	case errors.Is(err, update.ErrUpToDate):
-		fmt.Fprintf(out, "already up to date (%s)\n", cfg.Version)
-		return true, nil
-	case err != nil:
-		return true, err
-	}
-	fmt.Fprintf(out, "updated %s -> %s\n", result.From, result.To)
-	return true, nil
+	return true, svc.Do(ctx, manager, verb, out)
 }
 
 func (c Config) usage() string {
