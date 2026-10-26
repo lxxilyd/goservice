@@ -1,20 +1,21 @@
 // Command agent is a self-contained example of the goservice packages: a small
-// HTTP daemon that can install itself as a system service.
+// daemon that installs itself as a system service. It deliberately does nothing
+// useful — just a heartbeat until it is stopped — so that the whole file is
+// about wiring a service, and it links no third party code at all.
 //
-//	agent -addr 127.0.0.1:8080                     run in the foreground
-//	agent -addr 127.0.0.1:8080 service install     install + start as a service
+//	agent                                 run in the foreground
+//	agent service install                 install + start as a service
 //	agent service status | start | stop | restart
 //	agent service uninstall
-//	agent -backend sysv service install            write a specific backend's files
-//	agent backends                                 list the backends this build has
+//	agent -backend sysv service install   write a specific backend's files
+//	agent backends                        list the backends this build has
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
-	"net"
-	"net/http"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -39,7 +40,6 @@ func main() {
 
 func realMain() error {
 	name := flag.String("name", "example-agent", "service name")
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	backend := flag.String("backend", "", "force a service backend instead of detecting one (see svc.Backends)")
 	logDir := flag.String("logdir", "", "directory for stdout/stderr on init-script backends")
 
@@ -62,24 +62,24 @@ func realMain() error {
 		//
 		// Leaving Args empty is the other option: then the arguments after
 		// "service <verb>" become the command line, e.g.
-		//   agent service install -addr 127.0.0.1:8080 run
-		// installs "-addr 127.0.0.1:8080 run". Config.Strip lists the flags that
-		// must not be copied in that case.
-		Args:         []string{"-name", *name, "-addr", *addr, "run"},
+		//   agent service install run
+		// installs "run". Config.Strip lists the flags that must not be copied
+		// in that case.
+		Args:         []string{"-name", *name, "run"},
 		LogDir:       *logDir,
 		Restart:      true,
 		RestartSec:   5 * time.Second,
 		AutoStart:    true,
 		Dependencies: []string{"network-online.target"},
-		// serve() calls svc.NotifyReady, so the unit has to be Type=notify for
+		// work() calls svc.NotifyReady, so the unit has to be Type=notify for
 		// that to mean anything.
 		Notify: true,
 	}
 
 	// On Windows the process may have been started by the Service Control
-	// Manager. In that case serve and return; on other platforms this is false.
+	// Manager. In that case work and return; on other platforms this is false.
 	if handled, err := svc.RunServiceIfNeeded(*name, func(ctx context.Context) error {
-		return serve(ctx, *addr)
+		return work(ctx)
 	}); handled {
 		return err
 	}
@@ -97,7 +97,7 @@ func realMain() error {
 
 	switch command := flag.Arg(0); command {
 	case "", "run":
-		return serve(ctx, *addr)
+		return work(ctx)
 	case "backends":
 		fmt.Println(strings.Join(svc.Backends(), "\n"))
 		return nil
@@ -106,35 +106,26 @@ func realMain() error {
 	}
 }
 
-func serve(ctx context.Context, addr string) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "ok")
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "example-agent %s\n", version)
-	})
-
-	server := &http.Server{Handler: mux}
-
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
+// work is the daemon: a heartbeat until the context is cancelled. Everything
+// interesting about running as a service is the lifecycle around it — telling
+// systemd we are up, and stopping cleanly when the context ends.
+func work(ctx context.Context) error {
+	log.Printf("example-agent %s started (pid %d)", version, os.Getpid())
 
 	// Tell systemd (Type=notify) that we are serving.
 	_ = svc.NotifyReady()
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.Serve(listener) }()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		_ = svc.NotifyStopping()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return server.Shutdown(shutdownCtx)
+	for {
+		select {
+		case <-ctx.Done():
+			_ = svc.NotifyStopping()
+			log.Println("shutting down")
+			return nil
+		case <-ticker.C:
+			log.Printf("example-agent %s heartbeat", version)
+		}
 	}
 }
