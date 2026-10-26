@@ -272,8 +272,6 @@ func serviceStateString(state winsvc.State) string {
 
 // Windows failure actions, see
 // https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_failure_actionsa
-const serviceConfigFailureActions = 2
-
 type recoveryAction struct {
 	recoveryType uint32
 	delay        uint32 // milliseconds
@@ -312,10 +310,13 @@ func configureRecovery(handle windows.Handle, delay time.Duration) error {
 		return err
 	}
 
+	// The flag has its own info level. Passing FAILURE_ACTIONS (2) here makes the
+	// SCM parse this four-byte struct as a SERVICE_FAILURE_ACTIONSW, follow a
+	// garbage pointer and fault with 0xc0000005 in advapi32.
 	flag := serviceFailureActionsFlag{enableActionsForStopsWithErr: 1}
 	return windows.ChangeServiceConfig2(
 		handle,
-		serviceConfigFailureActions,
+		windows.SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
 		(*byte)(unsafe.Pointer(&flag)),
 	)
 }
