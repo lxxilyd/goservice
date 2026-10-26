@@ -50,6 +50,25 @@ status, err := manager.Status(ctx)    // State、PID、后端细节
 
 `svc.NotifyReady()` / `NotifyStopping()` 在非 Linux 平台是空操作，只要设了 `Definition.Notify` 就可以无条件调用。
 
+### 指定后端
+
+自动探测基本够用，但有时你就是要那一个：在 systemd 的机器上生成一份 SysV 脚本做对照、探测失败的定制固件上明确走 procd、或者在测试里只验证某个后端的产物。
+
+```go
+manager, err := svc.NewWith("sysv", def)   // 空字符串等价于 svc.New
+fmt.Println(svc.Backends())                // 这个构建里有哪些后端，按名字排序
+```
+
+可用的名字随目标平台变化：Linux 是 `systemd` / `procd` / `sysv`，macOS 是 `launchd`，BSD 是 `rcd`，Windows 是 `windows`。写错名字会得到一条列出全部可选值的错误；没有已知服务管理器的平台返回 `svc.ErrUnsupported`。
+
+有一点要知道：`Definition` 的部分字段只有部分后端认，其余后端会**静默忽略**（这是刻意的取舍，装服务不该因为多填了一个字段就失败，但排查时要心里有数）。
+
+| 字段 | systemd | sysv | procd | launchd | rcd | windows |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Env` | ✔ | ✔ | ✔ | ✔ | ✘ | ✘ |
+| `WorkingDir` | ✔ | ✘ | ✘ | ✔ | ✘ | ✘ |
+| `LogDir` | ✘（进 journal） | ✔ | ✘（进 syslog） | ✔ | ✘ | ✘ |
+
 ## 自更新
 
 ```go
@@ -131,9 +150,38 @@ release.Header = update.AuthHeader("", "token 0123abcd")          // 已带 sche
 
 优先级：`Release.Header` > `Updater.Header`（后者适合“所有产物共用一个凭据”的场景，自定义 `Source` 也能用）。`Updater.Client` 可换成带 mTLS 或自定义代理的 client。
 
+### 解包（tar.gz / zip）
+
+默认把下载到的字节直接当二进制用。发行包是压缩包时，挂一个 `Unpack` 钩子即可——它拿到的只是 `io.Reader`，写出来的才是要装的可执行文件：
+
+```go
+updater := &update.Updater{
+	Source: &update.GitHubSource{Owner: "you", Repo: "mydaemon"},
+	// 从 app_1.2.3_linux_amd64/app 里取，也接受扁平命名的 app_linux_amd64
+	Unpack: update.TarGz("app"),
+	// Unpack: update.Zip("app.exe"),
+}
+```
+
+`TarGz` / `Zip` 先按完整路径匹配成员名，再按 basename 兜底；找不到时报错会列出包里实际的文件名。`Zip` 需要产物是 `*os.File`（`Updater` 传进去的始终是），因为 zip 要随机读取。
+
+钩子签名就是一行，任何格式都能自己接：
+
+```go
+Unpack: func(rel update.Release, artifact io.Reader, w io.Writer) error {
+	// 解一个自己定义的封装、挑 CPU 变体、甚至只做完整性搬运
+}
+```
+
+校验发生在解包**之前**：`Release.SHA256` 是产物的摘要，不是里面二进制的摘要，所以校验通过后才解包。
+
+### 大小上限
+
+`Updater.MaxBytes` 默认 512 MiB，负值表示不限。下载是流式的（`io.Copy` + 边下边算 SHA-256 写 `<binary>.part`），不是 `io.ReadAll`，所以 40 MB 的二进制只占几十 KB 的缓冲——路由器上尤其重要。
+
 ### 其余行为
 
-替换会先写同目录的 `<binary>.new` 再 rename 到位，崩在中间也不会留下半个二进制。release 带 SHA-256 时自动校验，`Updater.Verify` 再加一道签名校验。`Updater.Managed` 返回真时拒绝自更新，把升级交给包管理器。`update.CleanupOldBinary` 用于清理 Windows 自更新留下的 `.old` 文件，启动时调一次即可。
+替换会先把产物落到同目录的 `<binary>.part`，校验/解包后成为 `<binary>.new`，最后 rename 到位，中间任何一步崩掉都不会留下半个二进制。release 带 SHA-256 时自动校验；`Updater.Verify` 拿的是**产物路径**（不是内存里的字节，大文件也能用），适合再做一道签名校验。`Updater.Managed` 返回真时拒绝自更新，把升级交给包管理器。`update.CleanupOldBinary` 用于清理 Windows 自更新留下的 `.old` 文件，启动时调一次即可。
 
 ## Windows Server：这里已经处理掉的坑
 
@@ -174,11 +222,22 @@ go test ./...                                  # 单元测试，不需要任何�
 GOOS=linux GOARCH=mipsle go build ./...        # 以及其它目标平台
 ```
 
+`svc` 的 5 个后端都要真正写出文件，所以它们的渲染函数放在没有 build tag 的 `render.go` 里，由 `svc/testdata/*.golden` 逐个比对生成的 unit、SysV/procd/rc.d 脚本和 plist —— 在任何一台机器上跑测试都能发现"改了模板改坏了"。`TestRenderIsStable` 还会反复渲染，防止 `Definition.Env`（map）导致每次安装写出不同顺序的文件。
+
+改模板后重新生成：
+
+```
+UPDATE_GOLDEN=1 go test ./svc
+```
+
 `examples/agent` 是一个可直接跑的守护进程，能把自己装成服务并自更新，是了解接线方式最快的入口：
 
 ```
+agent backends                                                                   # 本平台可用的后端
+agent -backend sysv install                                                      # 指定后端写文件
 agent -repo you/repo update                                                      # GitHub
 agent -repo you/repo -base-url https://git.example.com/api/v1 -token T update    # 自建 Gitea
 agent -gitlab group/app -base-url https://gitlab.example.com -token T update      # GitLab
 agent -url https://dl.example.com/app_linux_amd64 -remote-version v1.2.3 update  # 任意下载地址
+agent -repo you/repo -unpack app update                                          # 从 tar.gz/zip 里取 app
 ```

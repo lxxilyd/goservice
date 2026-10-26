@@ -55,6 +55,32 @@ status, err := manager.Status(ctx)    // State, PID, backend detail
 `svc.NotifyReady()` / `NotifyStopping()` are no-ops outside Linux, so they can
 be called unconditionally when `Definition.Notify` is set.
 
+### Choosing a backend
+
+Detection is usually right, but sometimes you want that specific one: render a
+SysV script on a systemd box to compare, force procd on vendor firmware whose
+detection is wrong, or exercise a single backend in a test.
+
+```go
+manager, err := svc.NewWith("sysv", def)   // "" behaves like svc.New
+fmt.Println(svc.Backends())                // what this build offers, sorted
+```
+
+The names depend on the target: `systemd` / `procd` / `sysv` on Linux,
+`launchd` on macOS, `rcd` on the BSDs and `windows` on Windows. A wrong name
+returns an error listing the alternatives; a platform with no known service
+manager returns `svc.ErrUnsupported`.
+
+One thing to know: some `Definition` fields are only honoured by some backends
+and are **silently ignored** by the rest. Installing a service should not fail
+because a field is unused, but it is worth knowing when debugging.
+
+| Field | systemd | sysv | procd | launchd | rcd | windows |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Env` | ✔ | ✔ | ✔ | ✔ | ✘ | ✘ |
+| `WorkingDir` | ✔ | ✘ | ✘ | ✔ | ✘ | ✘ |
+| `LogDir` | ✘ (journal) | ✔ | ✘ (syslog) | ✔ | ✘ | ✘ |
+
 ## Self-update
 
 ```go
@@ -155,11 +181,51 @@ Precedence: `Release.Header` over `Updater.Header` — the latter is the place f
 one credential shared by every artifact, and works with a custom `Source` too.
 `Updater.Client` accepts your own client for mTLS or a proxy.
 
+### Unpacking (tar.gz / zip)
+
+By default the downloaded bytes are the binary. When the release is an archive,
+plug in an `Unpack` hook: it sees the artifact as an `io.Reader` and writes the
+executable to install.
+
+```go
+updater := &update.Updater{
+	Source: &update.GitHubSource{Owner: "you", Repo: "mydaemon"},
+	// finds app inside app_1.2.3_linux_amd64/, or a flat app_linux_amd64
+	Unpack: update.TarGz("app"),
+	// Unpack: update.Zip("app.exe"),
+}
+```
+
+`TarGz` and `Zip` match the member by full path first, then by base name, and a
+miss reports the entries the archive actually holds. `Zip` needs the artifact as
+an `*os.File` (which is what `Updater` always passes), because a zip is read
+through a random-access index.
+
+The hook is one signature, so any format fits:
+
+```go
+Unpack: func(rel update.Release, artifact io.Reader, w io.Writer) error {
+	// unwrap your own envelope, pick a CPU variant, or just copy the bytes
+}
+```
+
+Verification runs **before** unpacking: `Release.SHA256` is the digest of the
+artifact, not of the binary inside it.
+
+### Size limit
+
+`Updater.MaxBytes` defaults to 512 MiB; a negative value disables the limit. The
+download is streamed (`io.Copy` into `<binary>.part` while hashing), not
+`io.ReadAll`, so a 40 MB binary costs a small buffer instead of 40 MB of RAM —
+which is what makes this usable on a router.
+
 ### Everything else
 
-The replacement is written to `<binary>.new` next to the target and renamed into
-place, so a crash never leaves a half written binary. SHA-256 is checked when
-the release exposes one; `Updater.Verify` adds a signature check. Set
+The artifact lands in `<binary>.part` next to the target, becomes
+`<binary>.new` once verified and unpacked, and is renamed into place, so a crash
+at any point never leaves a half written binary. SHA-256 is checked when the
+release exposes one; `Updater.Verify` receives the **artifact path** (not the
+bytes in memory, so it works for large files) for a signature check. Set
 `Updater.Managed` to refuse self-update when a package manager owns the binary.
 `update.CleanupOldBinary` removes the `.old` file a Windows self-update leaves
 behind.
@@ -229,12 +295,29 @@ go test ./...                                  # unit tests, no privileges neede
 GOOS=linux GOARCH=mipsle go build ./...        # and any other target
 ```
 
+All five `svc` backends write files for real, so their renderers live in
+`render.go` without a build tag and are compared against
+`svc/testdata/*.golden` — the unit, the SysV/procd/rc.d scripts and the plist.
+That means a broken template is caught by `go test ./svc` on any machine, not
+only on the platform that would consume it. `TestRenderIsStable` renders
+repeatedly to catch `Definition.Env` (a map) shuffling the output between
+installs.
+
+Regenerate after an intentional change:
+
+```
+UPDATE_GOLDEN=1 go test ./svc
+```
+
 `examples/agent` is a runnable daemon that installs itself as a service and
 self-updates; it is the shortest way to see the intended wiring:
 
 ```
+agent backends                                                                  # backends this platform offers
+agent -backend sysv install                                                     # write a specific backend's files
 agent -repo you/repo update                                                     # GitHub
 agent -repo you/repo -base-url https://git.example.com/api/v1 -token T update   # self-hosted Gitea
 agent -gitlab group/app -base-url https://gitlab.example.com -token T update    # GitLab
 agent -url https://dl.example.com/app_linux_amd64 -remote-version v1.2.3 update # any download URL
+agent -repo you/repo -unpack app update                                         # take app out of a tar.gz/zip
 ```

@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# PROVIDE: my-daemon
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# Installed by goservice.
+# Enable with:  sysrc my_daemon_enable=YES     (FreeBSD)
+#               echo 'my_daemon_enable="YES"' >> /etc/rc.conf   (OpenBSD/NetBSD)
+
+. /etc/rc.subr
+
+name="my-daemon"
+rcvar="my_daemon_enable"
+command="/usr/local/bin/my-daemon"
+command_args="'run' '--config' '/etc/my daemon.yml' 'it'\''s'"
+
+load_rc_config $name
+: ${ my_daemon_enable:="NO" }
+
+run_rc_command "$1"

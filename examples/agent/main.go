@@ -5,10 +5,12 @@
 //	agent -addr 127.0.0.1:8080 install             install + start as a service
 //	agent status | start | stop | restart
 //	agent uninstall
+//	agent -backend sysv install                    write a specific backend's files
 //	agent -repo owner/repo update                  self-update from GitHub
 //	agent -repo owner/repo -base-url https://git.example.com/api/v1 -token T update
 //	agent -gitlab group/app -base-url https://gitlab.example.com -token T update
-//	agent -url https://dl.example.com/app_linux_amd64 -version v1.2.3 update
+//	agent -url https://dl.example.com/app_linux_amd64 -remote-version v1.2.3 update
+//	agent -repo owner/repo -unpack app update      install the "app" member of a tar.gz/zip
 package main
 
 import (
@@ -16,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -41,18 +44,26 @@ func main() {
 }
 
 func realMain() error {
+	// A Windows self-update renames the running binary to <exe>.old and cannot
+	// delete it until the process exits, so the leftover is cleaned up here at
+	// startup. A no-op elsewhere.
+	_ = update.CleanupOldBinary("")
+
 	name := flag.String("name", "example-agent", "service name")
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	backend := flag.String("backend", "", "force a service backend instead of detecting one (see svc.Backends)")
 	repo := flag.String("repo", "", "owner/repo used by the update command")
 	gitlab := flag.String("gitlab", "", "GitLab project path or ID used by the update command")
 	baseURL := flag.String("base-url", "", "API root of a self-hosted git host, e.g. https://git.example.com/api/v1")
 	url := flag.String("url", "", "download one artifact directly, bypassing any release API")
 	remote := flag.String("remote-version", "", "version of -url when it cannot be read from the link")
 	token := flag.String("token", "", "token for a private repository or an authenticated download")
+	unpack := flag.String("unpack", "", "member to extract from a tar.gz/zip artifact before installing")
+	maxBytes := flag.Int64("max-bytes", 0, "cap the artifact size in bytes (0 default, negative unlimited)")
 	logDir := flag.String("logdir", "", "directory for stdout/stderr on init-script backends")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s [flags] [run|install|uninstall|start|stop|restart|status|update]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s [flags] [run|install|uninstall|start|stop|restart|status|update|backends]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -77,6 +88,9 @@ func realMain() error {
 		RestartSec:   5 * time.Second,
 		AutoStart:    true,
 		Dependencies: []string{"network-online.target"},
+		// serve() calls svc.NotifyReady, so the unit has to be Type=notify for
+		// that to mean anything.
+		Notify: true,
 	}
 
 	// On Windows the process may have been started by the Service Control
@@ -92,7 +106,7 @@ func realMain() error {
 		return serve(ctx, *addr)
 
 	case "install", "uninstall", "start", "stop", "restart", "status":
-		manager, err := svc.New(def)
+		manager, err := svc.NewWith(*backend, def)
 		if err != nil {
 			return err
 		}
@@ -101,13 +115,20 @@ func realMain() error {
 
 	case "update":
 		return runUpdate(ctx, def, updateOptions{
-			repo:    *repo,
-			gitlab:  *gitlab,
-			baseURL: *baseURL,
-			url:     *url,
-			version: *remote,
-			token:   *token,
+			backend:  *backend,
+			repo:     *repo,
+			gitlab:   *gitlab,
+			baseURL:  *baseURL,
+			url:      *url,
+			version:  *remote,
+			token:    *token,
+			unpack:   *unpack,
+			maxBytes: *maxBytes,
 		})
+
+	case "backends":
+		fmt.Println(strings.Join(svc.Backends(), "\n"))
+		return nil
 
 	default:
 		return fmt.Errorf("unknown command %q", command)
@@ -144,15 +165,18 @@ func runServiceCommand(ctx context.Context, manager svc.Manager, command string)
 	}
 }
 
-// updateOptions is what the -url / -repo / -gitlab / -base-url / -token flags
-// describe.
+// updateOptions is what the -url / -repo / -gitlab / -base-url / -token /
+// -unpack / -max-bytes flags describe.
 type updateOptions struct {
-	repo    string
-	gitlab  string
-	baseURL string
-	url     string
-	version string
-	token   string
+	backend  string
+	repo     string
+	gitlab   string
+	baseURL  string
+	url      string
+	version  string
+	token    string
+	unpack   string
+	maxBytes int64
 }
 
 func runUpdate(ctx context.Context, def svc.Definition, opts updateOptions) error {
@@ -162,11 +186,13 @@ func runUpdate(ctx context.Context, def svc.Definition, opts updateOptions) erro
 	}
 
 	updater := &update.Updater{
-		Source:  source,
-		Version: version,
+		Source:   source,
+		Version:  version,
+		Unpack:   unpackByURL(opts.unpack),
+		MaxBytes: opts.maxBytes,
 		// Restart through the service manager so the new binary takes over.
 		Restart: func(ctx context.Context) error {
-			manager, err := svc.New(def)
+			manager, err := svc.NewWith(opts.backend, def)
 			if err != nil {
 				return nil // not installed: the caller restarts it manually
 			}
@@ -209,6 +235,22 @@ func (o updateOptions) source() (update.Source, error) {
 		BaseURL: o.baseURL,
 		Token:   o.token,
 	}, nil
+}
+
+// unpackByURL builds the extraction hook. The choice between zip and tar.gz is
+// made per release, from Release.URL, because a Source only knows the artifact
+// URL once it has resolved one.
+func unpackByURL(member string) update.UnpackFunc {
+	if member == "" {
+		return nil
+	}
+	return func(rel update.Release, artifact io.Reader, w io.Writer) error {
+		artifactURL := strings.ToLower(strings.SplitN(rel.URL, "?", 2)[0])
+		if strings.HasSuffix(artifactURL, ".zip") {
+			return update.Zip(member)(rel, artifact, w)
+		}
+		return update.TarGz(member)(rel, artifact, w)
+	}
 }
 
 func serve(ctx context.Context, addr string) error {

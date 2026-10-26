@@ -1,6 +1,9 @@
 package svc
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestShellQuote(t *testing.T) {
 	cases := map[string]string{
@@ -86,5 +89,37 @@ func TestNormalizeDefaults(t *testing.T) {
 	empty := Definition{}
 	if err := empty.normalize(); err == nil {
 		t.Error("expected an error for an empty name")
+	}
+}
+
+// TestNewWithBackends checks that every backend this build advertises can be
+// constructed by name, and that an unknown name fails with the alternatives.
+func TestNewWithBackends(t *testing.T) {
+	def := Definition{Name: "my-daemon", ExecPath: "/usr/local/bin/my-daemon"}
+
+	names := Backends()
+	for _, name := range names {
+		manager, err := NewWith(name, def)
+		if err != nil {
+			t.Fatalf("NewWith(%q): %v", name, err)
+		}
+		if got := manager.Backend(); got != name {
+			t.Errorf("NewWith(%q).Backend() = %q", name, got)
+		}
+	}
+
+	if _, err := NewWith("definitely-not-a-backend", def); err == nil {
+		t.Error("an unknown backend was accepted")
+	} else if len(names) > 0 && !strings.Contains(err.Error(), names[0]) {
+		t.Errorf("error %q does not list the available backends %v", err, names)
+	}
+
+	// An empty name keeps the detected backend.
+	detected, err := NewWith("", def)
+	if err != nil {
+		t.Fatalf("NewWith(detected): %v", err)
+	}
+	if detected.Backend() == "" {
+		t.Error("the detected backend has no name")
 	}
 }

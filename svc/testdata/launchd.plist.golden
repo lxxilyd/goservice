@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>my-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/my-daemon</string>
+		<string>run</string>
+		<string>--config</string>
+		<string>/etc/my daemon.yml</string>
+		<string>it&apos;s</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/my-daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/my-daemon.err</string>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/my-daemon</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>A_MODE</key>
+		<string>prod</string>
+		<key>B_TOKEN</key>
+		<string>it&apos;s secret</string>
+	</dict>
+</dict>
+</plist>

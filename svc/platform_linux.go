@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+// backends are the managers this build compiles in; NewWith chooses from here
+// and New picks between them by probing the machine.
+var backends = map[string]func(Definition) Manager{
+	"systemd": newSystemdManager,
+	"procd":   newProcdManager,
+	"sysv":    newSysvManager,
+}
+
 // newPlatformManager picks the init system present on this machine.
 //
 // Order matters: a container or a router can have leftover SysV scripts while

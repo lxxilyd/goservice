@@ -1,0 +1,19 @@
+[Unit]
+Description=Example daemon for the renderer tests
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/my-daemon run --config "/etc/my daemon.yml" "it's"
+WorkingDirectory=/var/lib/my-daemon
+User=svcuser
+Group=svcgroup
+Environment=A_MODE=prod
+Environment="B_TOKEN=it's secret"
+EnvironmentFile=-/etc/my-daemon.env
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

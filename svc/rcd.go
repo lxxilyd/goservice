@@ -40,28 +40,14 @@ func (m *rcdManager) scriptPath() string     { return filepath.Join(rcdDir(), m.
 
 // rcvar must be a valid shell identifier, so '-' and '.' become '_'.
 func (m *rcdManager) rcvar() string {
-	replacer := strings.NewReplacer("-", "_", ".", "_")
-	return replacer.Replace(m.def.Name) + "_enable"
+	return rcvarFor(m.def.Name)
 }
 
-type rcdTemplateData struct {
-	Name     string
-	Rcvar    string
-	ConfPath string
-	Exec     string
-	ArgsLine string
-}
+// The rc.d data and its renderer live in render.go (no build tag), so the
+// generated script can be golden tested on any machine.
 
 func (m *rcdManager) Install(ctx context.Context) error {
-	data := rcdTemplateData{
-		Name:     m.def.Name,
-		Rcvar:    m.rcvar(),
-		ConfPath: rcdConfPath(),
-		Exec:     m.def.ExecPath,
-		ArgsLine: argLine(m.def.Args),
-	}
-
-	content := buildRcd(data)
+	content := buildRcd(rcdScriptFor(m.def, rcdConfPath()))
 	if err := writeFile(m.scriptPath(), content, 0o755); err != nil {
 		return err
 	}
@@ -172,14 +158,4 @@ func setShellVar(path, key, value string) error {
 	}
 
 	return os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
-}
-
-func buildRcd(d rcdTemplateData) string {
-	var b strings.Builder
-	b.WriteString("#!/bin/sh\n#\n# PROVIDE: " + d.Name + "\n# REQUIRE: NETWORKING\n# KEYWORD: shutdown\n#\n# Installed by goservice.\n# Enable with:  sysrc " + d.Rcvar + "=YES     (FreeBSD)\n#               echo '" + d.Rcvar + "=\"YES\"' >> " + d.ConfPath + "   (OpenBSD/NetBSD)\n\n. /etc/rc.subr\n\nname=\"" + d.Name + "\"\nrcvar=\"" + d.Rcvar + "\"\ncommand=\"" + d.Exec + "\"")
-	if d.ArgsLine != "" {
-		b.WriteString("\ncommand_args=\"" + d.ArgsLine + "\"")
-	}
-	b.WriteString("\n\nload_rc_config $name\n: ${ " + d.Rcvar + ":=\"NO\" }\n\nrun_rc_command \"$1\"\n")
-	return b.String()
 }

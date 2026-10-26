@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -157,10 +158,47 @@ type Manager interface {
 
 // New returns the Manager that fits the current machine.
 func New(def Definition) (Manager, error) {
+	return NewWith("", def)
+}
+
+// NewWith returns the Manager for a named backend instead of the one detected
+// for this machine, which is how you install a different unit than the host
+// would choose: generate a SysV script on a systemd box, script the procd path
+// on a router whose detection is wrong, or exercise a backend in a test.
+//
+// An empty name means automatic detection, exactly like New. Backends lists
+// what this build can offer; asking for anything else is an error that names
+// the alternatives.
+func NewWith(backend string, def Definition) (Manager, error) {
 	if err := def.normalize(); err != nil {
 		return nil, err
 	}
-	return newPlatformManager(def)
+	if backend == "" {
+		return newPlatformManager(def)
+	}
+
+	constructor, ok := backends[backend]
+	if !ok {
+		available := Backends()
+		if len(available) == 0 {
+			return nil, fmt.Errorf("svc: backend %q is not available here: %w", backend, ErrUnsupported)
+		}
+		return nil, fmt.Errorf("svc: unknown backend %q, this platform provides %s", backend, strings.Join(available, ", "))
+	}
+	return constructor(def), nil
+}
+
+// Backends lists the backends compiled into this build, sorted by name. It is
+// what NewWith accepts, and it changes with the target platform: "systemd",
+// "procd" and "sysv" on Linux, "launchd" on macOS, "rcd" on the BSDs and
+// "windows" on Windows.
+func Backends() []string {
+	names := make([]string, 0, len(backends))
+	for name := range backends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // -----------------------------------------------------------------------------
@@ -259,14 +297,15 @@ func argLine(args []string) string {
 	return strings.Join(quoted, " ")
 }
 
-// envLines renders KEY=VALUE pairs for a shell script or an EnvFile.
+// envLines renders KEY=VALUE pairs for a shell script or an EnvFile, in a stable
+// order so reinstalling does not rewrite the script with shuffled lines.
 func envLines(env map[string]string) string {
 	if len(env) == 0 {
 		return ""
 	}
 	lines := make([]string, 0, len(env))
-	for k, v := range env {
-		lines = append(lines, fmt.Sprintf("export %s=%s", k, shellQuote(v)))
+	for _, key := range sortedEnvKeys(env) {
+		lines = append(lines, fmt.Sprintf("export %s=%s", key, shellQuote(env[key])))
 	}
 	return strings.Join(lines, "\n")
 }

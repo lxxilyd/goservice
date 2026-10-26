@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 )
 
 // launchdManager installs a LaunchDaemon when running as root (starts at boot)
@@ -42,22 +41,8 @@ func newLaunchdManager(def Definition) Manager {
 func (m *launchdManager) Backend() string        { return "launchd" }
 func (m *launchdManager) Definition() Definition { return m.def }
 
-type launchdEnv struct {
-	K string
-	V string
-}
-
-type launchdPlistData struct {
-	Label      string
-	Exec       string
-	Args       []string
-	Restart    bool
-	Throttle   int
-	Stdout     string
-	Stderr     string
-	WorkingDir string
-	Env        []launchdEnv
-}
+// The plist data and its renderer live in render.go (no build tag), so the
+// generated plist can be golden tested on any machine.
 
 func (m *launchdManager) Install(ctx context.Context) error {
 	if m.plistPath == "" {
@@ -72,25 +57,7 @@ func (m *launchdManager) Install(ctx context.Context) error {
 		logDir = os.TempDir()
 	}
 
-	data := launchdPlistData{
-		Label:    xmlEscape(m.label),
-		Exec:     xmlEscape(m.def.ExecPath),
-		Restart:  m.def.Restart,
-		Throttle: int(m.def.RestartSec.Seconds()),
-		Stdout:   xmlEscape(filepath.Join(logDir, m.def.Name+".log")),
-		Stderr:   xmlEscape(filepath.Join(logDir, m.def.Name+".err")),
-	}
-	for _, arg := range m.def.Args {
-		data.Args = append(data.Args, xmlEscape(arg))
-	}
-	if m.def.WorkingDir != "" {
-		data.WorkingDir = xmlEscape(m.def.WorkingDir)
-	}
-	for k, v := range m.def.Env {
-		data.Env = append(data.Env, launchdEnv{K: xmlEscape(k), V: xmlEscape(v)})
-	}
-
-	content := buildLaunchd(data)
+	content := buildLaunchd(launchdPlistFor(m.def, m.label, logDir))
 	if err := writeFile(m.plistPath, content, 0o644); err != nil {
 		return err
 	}
@@ -152,29 +119,4 @@ func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 		}
 	}
 	return Status{State: StateStopped, Detail: "launchctl"}, nil
-}
-
-func buildLaunchd(d launchdPlistData) string {
-	var b strings.Builder
-	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>" + d.Label + "</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>" + d.Exec + "</string>")
-	for _, a := range d.Args {
-		b.WriteString("\n\t\t<string>" + a + "</string>")
-	}
-	b.WriteString("\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>")
-	if d.Restart {
-		b.WriteString("\n\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>")
-	}
-	b.WriteString("\n\t<key>ThrottleInterval</key>\n\t<integer>" + strconv.Itoa(d.Throttle) + "</integer>\n\t<key>StandardOutPath</key>\n\t<string>" + d.Stdout + "</string>\n\t<key>StandardErrorPath</key>\n\t<string>" + d.Stderr + "</string>")
-	if d.WorkingDir != "" {
-		b.WriteString("\n\t<key>WorkingDirectory</key>\n\t<string>" + d.WorkingDir + "</string>")
-	}
-	if len(d.Env) > 0 {
-		b.WriteString("\n\t<key>EnvironmentVariables</key>\n\t<dict>")
-		for _, e := range d.Env {
-			b.WriteString("\n\t\t<key>" + e.K + "</key>\n\t\t<string>" + e.V + "</string>")
-		}
-		b.WriteString("\n\t</dict>")
-	}
-	b.WriteString("\n</dict>\n</plist>\n")
-	return b.String()
 }

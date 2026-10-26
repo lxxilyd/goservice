@@ -30,6 +30,11 @@ var (
 	ErrChecksumMismatch = errors.New("update: checksum mismatch")
 )
 
+// defaultMaxBytes caps a download at 512 MiB, which is far above any single
+// daemon binary but small enough that a hostile or misconfigured endpoint
+// cannot exhaust the memory of a router.
+const defaultMaxBytes = 512 << 20
+
 // Release describes one published build.
 type Release struct {
 	Version string
@@ -108,9 +113,19 @@ type Updater struct {
 	// credential that is the same for every artifact. Release.Header wins on
 	// key conflicts, so a source that knows better can still override it.
 	Header http.Header
-	// Verify, when set, runs on the downloaded bytes before they are installed.
-	// Use it for a signature check; SHA-256 is already handled via Release.
-	Verify func(rel Release, data []byte) error
+	// MaxBytes caps the artifact size, which is the difference between a
+	// failed update and an OOM on a router with 64 MB of RAM. Zero means the
+	// 512 MiB default; a negative value disables the limit.
+	MaxBytes int64
+	// Verify, when set, runs on the downloaded artifact before it is installed
+	// and receives its path, so a large artifact is never held in memory. Use
+	// it for a signature check; SHA-256 is already handled via Release.
+	Verify func(rel Release, artifactPath string) error
+	// Unpack, when set, extracts the installable binary from the artifact
+	// instead of treating the download as the binary itself. Wire it to
+	// update.TarGz or update.Zip, or write your own to handle any archive or an
+	// install bundle.
+	Unpack UnpackFunc
 	// Restart, when set, is called after a successful replacement. Wire it to
 	// svc.Manager.Restart so the new binary actually takes over.
 	Restart func(ctx context.Context) error
@@ -154,6 +169,10 @@ func (u *Updater) Update(ctx context.Context) (Result, error) {
 }
 
 // Apply installs rel unconditionally (no version comparison).
+//
+// The artifact is streamed to <binary>.part while its digest is computed, and
+// the binary to install is prepared as <binary>.new before the atomic replace,
+// so an interrupted update never leaves a truncated executable behind.
 func (u *Updater) Apply(ctx context.Context, rel Release) (Result, error) {
 	if rel.URL == "" {
 		return Result{}, errors.New("update: release has no download URL")
@@ -164,30 +183,37 @@ func (u *Updater) Apply(ctx context.Context, rel Release) (Result, error) {
 		return Result{}, err
 	}
 
-	data, err := u.download(ctx, rel)
+	artifactPath := target + ".part"
+	staged := target + ".new"
+	defer os.Remove(artifactPath)
+
+	sum, err := u.download(ctx, rel, artifactPath)
 	if err != nil {
 		return Result{}, err
 	}
-	if rel.SHA256 != "" {
-		sum := sha256.Sum256(data)
-		if !strings.EqualFold(hex.EncodeToString(sum[:]), strings.TrimPrefix(rel.SHA256, "sha256:")) {
-			return Result{}, fmt.Errorf("%w: %s", ErrChecksumMismatch, rel.URL)
-		}
+	if rel.SHA256 != "" && !strings.EqualFold(sum, strings.TrimPrefix(rel.SHA256, "sha256:")) {
+		return Result{}, fmt.Errorf("%w: %s", ErrChecksumMismatch, rel.URL)
 	}
 	if u.Verify != nil {
-		if err := u.Verify(rel, data); err != nil {
+		if err := u.Verify(rel, artifactPath); err != nil {
 			return Result{}, fmt.Errorf("update: verification failed: %w", err)
 		}
 	}
 
-	staged := target + ".new"
-	if err := os.WriteFile(staged, data, 0o755); err != nil {
-		return Result{}, fmt.Errorf("update: staging %s: %w", staged, err)
-	}
-	// writeFile honours the umask, be explicit about the mode.
-	if err := os.Chmod(staged, 0o755); err != nil {
-		_ = os.Remove(staged)
-		return Result{}, fmt.Errorf("update: chmod %s: %w", staged, err)
+	switch {
+	case u.Unpack == nil:
+		// The artifact is the binary: chmod then rename, which is atomic within
+		// the directory.
+		if err := os.Chmod(artifactPath, 0o755); err != nil {
+			return Result{}, fmt.Errorf("update: chmod %s: %w", artifactPath, err)
+		}
+		if err := os.Rename(artifactPath, staged); err != nil {
+			return Result{}, fmt.Errorf("update: staging %s: %w", staged, err)
+		}
+	default:
+		if err := u.unpack(rel, artifactPath, staged); err != nil {
+			return Result{}, err
+		}
 	}
 
 	if err := replaceFile(staged, target); err != nil {
@@ -205,6 +231,42 @@ func (u *Updater) Apply(ctx context.Context, rel Release) (Result, error) {
 	return Result{Updated: true, From: u.Version, To: rel.Version}, nil
 }
 
+// unpack runs the Unpack hook from the artifact into the staged binary.
+func (u *Updater) unpack(rel Release, artifactPath, staged string) error {
+	artifact, err := os.Open(artifactPath)
+	if err != nil {
+		return fmt.Errorf("update: opening %s: %w", artifactPath, err)
+	}
+	defer artifact.Close()
+
+	out, err := os.OpenFile(staged, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return fmt.Errorf("update: staging %s: %w", staged, err)
+	}
+
+	if err := u.Unpack(rel, artifact, out); err != nil {
+		out.Close()
+		_ = os.Remove(staged)
+		return fmt.Errorf("update: unpacking %s: %w", rel.URL, err)
+	}
+	// The hook writes whatever it likes; make sure the bytes hit the disk
+	// before the rename, and that the result is executable.
+	if err := out.Sync(); err != nil {
+		out.Close()
+		_ = os.Remove(staged)
+		return fmt.Errorf("update: syncing %s: %w", staged, err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(staged)
+		return fmt.Errorf("update: closing %s: %w", staged, err)
+	}
+	if err := os.Chmod(staged, 0o755); err != nil {
+		_ = os.Remove(staged)
+		return fmt.Errorf("update: chmod %s: %w", staged, err)
+	}
+	return nil
+}
+
 func (u *Updater) binaryPath() (string, error) {
 	if u.BinaryPath != "" {
 		return u.BinaryPath, nil
@@ -219,7 +281,22 @@ func (u *Updater) binaryPath() (string, error) {
 	return exe, nil
 }
 
-func (u *Updater) download(ctx context.Context, rel Release) ([]byte, error) {
+// maxBytes resolves MaxBytes into a hard limit, 0 meaning unlimited.
+func (u *Updater) maxBytes() int64 {
+	switch {
+	case u.MaxBytes < 0:
+		return 0
+	case u.MaxBytes == 0:
+		return defaultMaxBytes
+	default:
+		return u.MaxBytes
+	}
+}
+
+// download streams rel into path and returns the artifact's SHA-256 in hex.
+// Reading through io.Copy instead of io.ReadAll is what keeps a 40 MB binary
+// from costing 40 MB of RAM on an embedded target.
+func (u *Updater) download(ctx context.Context, rel Release, path string) (string, error) {
 	client := u.Client
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
@@ -227,7 +304,7 @@ func (u *Updater) download(ctx context.Context, rel Release) ([]byte, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rel.URL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("update: building request: %w", err)
+		return "", fmt.Errorf("update: building request: %w", err)
 	}
 	for name, values := range u.Header {
 		for _, value := range values {
@@ -243,14 +320,50 @@ func (u *Updater) download(ctx context.Context, rel Release) ([]byte, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("update: downloading %s: %w", rel.URL, err)
+		return "", fmt.Errorf("update: downloading %s: %w", rel.URL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("update: downloading %s: unexpected status %s", rel.URL, resp.Status)
+		return "", fmt.Errorf("update: downloading %s: unexpected status %s", rel.URL, resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+
+	limit := u.maxBytes()
+	if limit > 0 && resp.ContentLength > limit {
+		return "", fmt.Errorf("update: %s is %d bytes, over the %d byte limit", rel.URL, resp.ContentLength, limit)
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("update: creating %s: %w", path, err)
+	}
+
+	digest := sha256.New()
+	body := io.Reader(resp.Body)
+	if limit > 0 {
+		// Read one byte past the limit so an oversized body is detected rather
+		// than silently truncated.
+		body = io.LimitReader(resp.Body, limit+1)
+	}
+	written, err := io.Copy(io.MultiWriter(file, digest), body)
+	if err == nil && limit > 0 && written > limit {
+		err = fmt.Errorf("%s is larger than the %d byte limit", rel.URL, limit)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("update: downloading %s: %w", rel.URL, err)
+	}
+	if written == 0 {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("update: downloading %s: empty response", rel.URL)
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 // CleanupOldBinary removes the .old file a Windows self-update leaves behind.
