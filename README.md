@@ -82,6 +82,7 @@ result, err := up.Update(ctx) // 无新版本时返回 update.ErrUpToDate
 ```
 
 - **凭据**：`update.Auth{Token: "..."}` 走 `Authorization: Bearer`；GitLab PAT 自动用 `PRIVATE-TOKEN`；自定义头名填 `Header`。
+- **资产名**：默认匹配 `<repo>_<os>_<arch>`，`-`/`_`、`.exe`/`.tar.gz` 这类差别不敏感，所以 `gottyd-windows-amd64.exe` 直接命中；匹配不会跨架构（`gottyd_linux_arm` 不会选到 `gottyd_linux_arm64`），命名不规则时用 `AssetPattern` 明确指定。
 - **解包**：`update.TarGz("成员名")` / `update.Zip("成员名")`，或自己写 `func(rel, io.Reader, io.Writer) error`。校验发生在解包之前。
 - **体积与安全**：`Target.MaxBytes` 默认 512 MiB（负值不限），下载是流式的，不占内存；`Target.Verify` 拿到产物路径，可做签名校验。
 - **替换**：先写 `<binary>.part`，校验/解包后成为 `<binary>.new`，最后 rename，中途崩掉不留半个二进制。

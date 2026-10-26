@@ -92,6 +92,10 @@ result, err := up.Update(ctx) // update.ErrUpToDate when nothing to do
 
 - **Credentials**: `update.Auth{Token: "..."}` sends `Authorization: Bearer`; a
   GitLab PAT uses `PRIVATE-TOKEN` automatically; `Header` overrides the name.
+- **Asset names**: the default pattern is `<repo>_<os>_<arch>`, and `-` vs `_`
+  plus `.exe`/`.tar.gz` style suffixes are ignored, so `gottyd-windows-amd64.exe`
+  just matches. Matching never crosses architectures (`gottyd_linux_arm` will not
+  pick `gottyd_linux_arm64`); use `AssetPattern` when the naming is irregular.
 - **Unpacking**: `update.TarGz("member")` / `update.Zip("member")`, or your own
   `func(rel, io.Reader, io.Writer) error`. Verification runs before unpacking.
 - **Size and safety**: `Target.MaxBytes` defaults to 512 MiB (negative disables),

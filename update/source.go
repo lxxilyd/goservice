@@ -174,12 +174,12 @@ func (g *GitHubSource) assetName(req Request) string {
 
 func pickAsset(assets []ghAsset, expected string) *ghAsset {
 	for i := range assets {
-		if assets[i].Name == expected {
+		if assetMatch(assets[i].Name, expected) == assetExact {
 			return &assets[i]
 		}
 	}
 	for i := range assets {
-		if strings.Contains(assets[i].Name, expected) {
+		if assetMatch(assets[i].Name, expected) == assetLoose {
 			return &assets[i]
 		}
 	}

@@ -170,12 +170,12 @@ func (g *GitLabSource) release(rel glRelease, link *glLink) Release {
 
 func pickLink(links []glLink, expected string) *glLink {
 	for i := range links {
-		if links[i].Name == expected {
+		if assetMatch(links[i].Name, expected) == assetExact {
 			return &links[i]
 		}
 	}
 	for i := range links {
-		if strings.Contains(links[i].Name, expected) {
+		if assetMatch(links[i].Name, expected) == assetLoose {
 			return &links[i]
 		}
 	}
