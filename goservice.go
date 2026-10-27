@@ -9,10 +9,11 @@
 // svc.Do directly.
 //
 //	func main() {
-//		handled, err := goservice.Handle(ctx, flag.Args(), goservice.Config{
+//		served, err := goservice.Handle(ctx, flag.Args(), goservice.Config{
 //			Service: svc.Definition{Name: "gottyd", ExecPath: "/usr/local/bin/gottyd", Restart: true, AutoStart: true},
+//			Run:     serve, // used when the Windows service manager starts us
 //		})
-//		if handled {
+//		if served {
 //			exit(err)
 //		}
 //		// ... the daemon's own work
@@ -47,6 +48,15 @@ type Config struct {
 	// the service command line.
 	Strip []string
 
+	// Run is the daemon itself, and it matters on Windows: when the Service
+	// Control Manager starts the process, the process has to register with the
+	// SCM dispatcher instead of just executing its flags, or the SCM gives up
+	// after ~30 seconds with "service did not respond in a timely fashion".
+	// Handle takes care of that whenever Run is set. Elsewhere, and in a
+	// console, it is never called by Handle — the caller runs the daemon its
+	// own way.
+	Run func(ctx context.Context) error
+
 	// Out receives the progress and status lines. Defaults to os.Stdout.
 	Out io.Writer
 	// Usage overrides the message printed when "service" is given without a
@@ -59,10 +69,23 @@ type Config struct {
 // A false return means args[0] is not "service" (or it was escaped with "--"),
 // so the caller should continue with its normal argument handling. A true
 // return means the command has run, and err is its outcome.
+//
+// When Config.Run is set it also covers the other way a process ends up being
+// started: the Windows service manager launching it directly instead of a user
+// typing "service start". That case is not a command line at all, which is why
+// it cannot be folded into the verb dispatch — but it belongs to the same call,
+// so main does not have to know about it.
 func Handle(ctx context.Context, args []string, cfg Config) (handled bool, err error) {
 	verb, rest, ok := svc.ServiceCommand(args)
 	if !ok {
-		return false, nil
+		if cfg.Run == nil {
+			return false, nil
+		}
+		// Not a service command. On Windows this may be the SCM talking, in
+		// which case the daemon has to serve here and report its status; in a
+		// console (and everywhere else) it reports false and the caller carries
+		// on with its normal path.
+		return svc.RunServiceIfNeeded(cfg.Service.Name, cfg.Run)
 	}
 
 	out := cfg.Out

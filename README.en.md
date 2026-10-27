@@ -22,6 +22,7 @@ func main() {
 			Restart:   true,
 			AutoStart: true,
 		},
+		Run: work, // used when the Windows SCM launches the process; never called in a console
 	})
 	if handled {
 		if err != nil {
@@ -69,6 +70,11 @@ systemd logs to the journal) and are **silently ignored** elsewhere.
 - **Moving a service**: re-running `install` from another path rewrites the unit
   on Linux/BSD while Windows keeps the original `BinaryPathName` (it is not in
   the updated fields). `uninstall` then `install` is predictable everywhere.
+- **`Run` is required**: on Windows the SCM launches the process itself rather
+  than a user typing "service start", and the process then has to register with
+  the dispatcher and report status — without that the SCM kills it after ~30
+  seconds ("service did not respond in a timely fashion"). `Handle` covers it
+  whenever `Run` is set, so `main` needs no extra branch.
 - **Argument snapshot**: when `Service.Args` is empty, the arguments after
   `service <verb>` become the service command line
   (`mydaemon service install -p 8080 bash`); `Config.Strip` names the flags that

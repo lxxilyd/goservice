@@ -21,6 +21,7 @@ func main() {
 			Restart:   true,
 			AutoStart: true,
 		},
+		Run: work, // Windows 服务管理器直接拉起进程时跑它；控制台和 Linux 上不会调
 	})
 	if handled {
 		if err != nil {
@@ -56,6 +57,7 @@ func main() {
 
 - **`ExecPath` 必须显式**：留空时取当前运行的二进制（解析符号链接），这是便利不是推荐。`svc` 不会替你复制文件——从 `/tmp` 或下载目录跑一次 `install`，unit 就永久指向那里。生产安装应先把二进制放到稳定路径（`/usr/local/bin/<name>`、`%ProgramFiles%\<Name>\<name>.exe`），再显式设置 `ExecPath`。
 - **换路径重装**：已安装后从另一个路径再 `install`，Linux/BSD 会把 unit 改指新路径，Windows 不会（`BinaryPathName` 不在更新字段里）。想换路径，先 `uninstall` 再 `install` 更可预期。
+- **`Run` 必须给**：Windows 上服务是由 SCM 直接拉起进程的，不是用户敲 `service start`。这时候进程要向 SCM 注册并汇报状态，否则约 30 秒后 SCM 会判定“服务未及时响应”并杀掉它。传了 `Run` 之后 `Handle` 自动处理这段，`main` 里不用再单独判断。
 - **参数快照**：`Service.Args` 为空时，`service <verb>` 之后的参数成为服务命令行（`mydaemon service install -p 8080 bash`）；`Config.Strip` 指定哪些 flag 不该带进去（如 `-d`）。要写进服务的 flag 放在 `service <verb>` 之后。
 - **Windows**：事件日志是尽力而为（失败不回滚服务）；`CreateService` 不带描述，避免 x/sys 删掉半装的服务；`Status().Detail` 显示真实 `BinaryPathName`，用于排查“装了但没跑”；服务跑在 session 0，配置和凭据请用绝对路径。
 - **嵌入式**：`sysv` 只写 POSIX sh（无 bashisms、无 `readlink -f`，存活判断用 `kill -0`）；`LogDir` 不可写时回退 `/tmp`；`/etc/rc.common` 存在时优先 `procd`；进程查找扫 `/proc/<pid>/exe`，不依赖 `pgrep`/`pidof`。

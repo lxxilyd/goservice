@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/lxxilyd/goservice/svc"
 )
 
 // TestHandleIgnoresOtherCommands is the contract the caller depends on: anything
@@ -46,5 +48,24 @@ func TestHandleUsageAndUnknownVerb(t *testing.T) {
 	handled, err = Handle(context.Background(), []string{"service", "update"}, Config{})
 	if !handled || err == nil || !strings.Contains(err.Error(), "update") {
 		t.Fatalf("removed update verb = (%v, %v)", handled, err)
+	}
+}
+
+// TestHandleLeavesTheDaemonToTheCaller: outside the Windows service manager the
+// daemon is the caller's business. Handle must report "not a service command"
+// and leave Run alone, or main would never reach its own foreground path.
+func TestHandleLeavesTheDaemonToTheCaller(t *testing.T) {
+	called := false
+	cfg := Config{
+		Service: svc.Definition{Name: "testdaemon", ExecPath: "/bin/true"},
+		Run:     func(context.Context) error { called = true; return nil },
+	}
+
+	handled, err := Handle(context.Background(), []string{"run"}, cfg)
+	if handled || err != nil {
+		t.Fatalf("Handle(run) = (%v, %v), want (false, nil)", handled, err)
+	}
+	if called {
+		t.Fatal("Run was called outside the service manager")
 	}
 }

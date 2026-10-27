@@ -76,20 +76,14 @@ func realMain() error {
 		Notify: true,
 	}
 
-	// On Windows the process may have been started by the Service Control
-	// Manager. In that case work and return; on other platforms this is false.
-	if handled, err := svc.RunServiceIfNeeded(*name, func(ctx context.Context) error {
-		return work(ctx)
-	}); handled {
-		return err
-	}
-
-	// The whole service surface in one call: "service install", "service
-	// status" and the rest. Anything that is not a service command falls
-	// through, and the daemon handles its own arguments below.
+	// One call covers both ways this process can start: "service install" and
+	// the other verbs on the command line, or the Windows service manager
+	// launching the binary directly (that is what Run is for). Anything else
+	// falls through to the daemon below.
 	handled, err := goservice.Handle(ctx, flag.Args(), goservice.Config{
 		Backend: *backend,
 		Service: def,
+		Run:     work,
 	})
 	if handled {
 		return err
